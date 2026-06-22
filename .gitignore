@@ -2,3 +2,4 @@ uictl
 uictld
 *.o
 *.md
+compile_flags.txt
