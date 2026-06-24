@@ -6,10 +6,10 @@ override LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 
 all: uictl uictld
 
-uictl: src/uictl.c
+uictl: src/uictl.c src/proto.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-uictld: src/uictld.c
+uictld: src/uictld.c src/proto.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 .PHONY: all clean
