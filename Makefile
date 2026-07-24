@@ -6,11 +6,14 @@ override LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 
 all: uictl uictld
 
+UICTLD_SRCS = src/uictld.c src/platform/uinput.c
+UICTLD_HDRS = src/proto.h src/platform/uinput.h
+
 uictl: src/uictl.c src/proto.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-uictld: src/uictld.c src/proto.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+uictld:	$(UICTLD_SRCS) $(UICTLD_HDRS)
+	$(CC) $(CFLAGS) $(UICTLD_SRCS) -o $@ $(LDFLAGS)
 
 .PHONY: all clean
 clean:

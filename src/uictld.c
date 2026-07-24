@@ -1,13 +1,15 @@
+#include "platform/uinput.h"
 #include "proto.h"
-#include <bits/time.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/file.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -16,11 +18,6 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t stop = 0;
-
-static void on_signal(int signo) {
-  (void)signo;
-  stop = 1;
-}
 
 static const char *opname(uint16_t op) {
   switch (op) {
@@ -142,17 +139,12 @@ int main(void) {
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
   strcpy(addr.sun_path, path);
 
-  struct sigaction sa = {.sa_handler = on_signal};
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-
-  if (sigaction(SIGINT, &sa, NULL) < 0) {
-    perror("uictld: sigaction SIGINT");
-    close(sfd);
-    return 1;
-  }
-  if (sigaction(SIGTERM, &sa, NULL) < 0) {
-    perror("uictld: sigaction SIGTERM");
+  sigset_t mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGINT);
+  sigaddset(&mask, SIGTERM);
+  if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
+    perror("uictld: sigprocmask");
     close(sfd);
     return 1;
   }
@@ -208,7 +200,6 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    close(lockfd);
     return 1;
   }
 
@@ -228,124 +219,196 @@ int main(void) {
     return 1;
   }
 
+  int uinput_fd = uinput_open();
+  if (uinput_fd < 0) {
+    close(audit_fd);
+    close(lockfd);
+    close(sfd);
+    unlink(path);
+    return 1;
+  }
+
+  int sigfd = signalfd(-1, &mask, SFD_CLOEXEC);
+  if (sigfd < 0) {
+    perror("uictld: signalfd");
+    uinput_close(uinput_fd);
+    close(audit_fd);
+    close(lockfd);
+    close(sfd);
+    unlink(path);
+    return 1;
+  }
+
+  int epfd = epoll_create1(EPOLL_CLOEXEC);
+  if (epfd < 0) {
+    perror("uictld: epoll_create1");
+    uinput_close(uinput_fd);
+    close(sigfd);
+    close(audit_fd);
+    close(lockfd);
+    close(sfd);
+    unlink(path);
+    return 1;
+  }
+  struct epoll_event ev = {.events = EPOLLIN, .data.fd = sfd};
+  epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev);
+  ev.data.fd = sigfd;
+  epoll_ctl(epfd, EPOLL_CTL_ADD, sigfd, &ev);
+
   printf("uictld: listening on %s\n", path);
   fflush(stdout);
 
+  struct epoll_event events[8];
+  int stop = 0;
+
   while (!stop) {
-    int cfd = accept4(sfd, NULL, NULL, SOCK_CLOEXEC);
-    if (cfd < 0) {
+    int nfd = epoll_wait(epfd, events, 8, -1);
+    if (nfd < 0) {
       if (errno == EINTR)
         continue;
-      perror("uictld: accept4");
-      continue;
+      perror("uictld: epoll_wait");
+      break;
     }
 
-    struct ucred cred;
-    socklen_t cred_len = sizeof(cred);
-    if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0) {
-      perror("uictld: getsockopt SO_PEERCRED");
-      close(cfd);
-      continue;
-    }
-    if (cred.uid != getuid()) {
-      audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0,
-                ERR_DENIED_BY_POLICY, "peer uid mismatch");
-      struct uictl_frame_header deny = {.version = UICTL_PROTO_VERSION,
-                                        .opcode = OP_INVALID,
-                                        .source_tag = 0,
-                                        .seq = 0,
-                                        .payload_len = sizeof(uint16_t)};
-      char deny_buf[sizeof(deny) + sizeof(uint16_t)];
-      encode_frame_header(&deny, deny_buf);
-      uint16_t deny_result = ERR_DENIED_BY_POLICY;
-      memcpy(deny_buf + sizeof(deny), &deny_result, sizeof(deny_result));
-      (void)write_full(cfd, deny_buf, sizeof(deny_buf));
-      close(cfd);
-      continue;
-    }
+    for (int i = 0; i < nfd; i++) {
+      if (events[i].data.fd == sigfd) {
+        struct signalfd_siginfo si;
+        if (read(sigfd, &si, sizeof(si)) == (ssize_t)sizeof(si))
+          fprintf(stderr, "uictld: signal %u, shutting down\n", si.ssi_signo);
+        else
+          perror("uictld: read signalfd");
 
-    char hdr_buf[sizeof(struct uictl_frame_header)];
-    ssize_t rh = read_full(cfd, hdr_buf, sizeof(hdr_buf));
-    if (rh < 0) {
-      perror("uictld: read header");
-      close(cfd);
-      continue;
-    }
-    if ((size_t)rh != sizeof(hdr_buf)) {
-      fprintf(stderr, "uictld: client closed mid-header\n");
-      close(cfd);
-      continue;
-    }
-
-    struct uictl_frame_header req;
-    decode_frame_header(hdr_buf, &req);
-
-    struct uictl_frame_header resp = req;
-    resp.payload_len = sizeof(uint16_t);
-
-    uint16_t result;
-    char payload_buf[UICTL_MAX_PAYLOAD];
-
-    if (req.version != UICTL_PROTO_VERSION) {
-      result = ERR_VERSION;
-    } else if (req.payload_len > UICTL_MAX_PAYLOAD) {
-      result = ERR_TOO_LARGE;
-    } else {
-      ssize_t rp = read_full(cfd, payload_buf, req.payload_len);
-      if (rp < 0) {
-        perror("uictld: read payload");
-        close(cfd);
-        continue;
-      }
-      if ((size_t)rp != req.payload_len) {
-        fprintf(stderr, "uictld: client closed mid-payload\n");
-        close(cfd);
-        continue;
-      }
-
-      switch (req.opcode) {
-      case OP_PING:
-        result = (req.payload_len == 0) ? OK : ERR_PAYLOAD_INVALID;
+        stop = 1;
         break;
-      case OP_MOVE_ABS:
-        if (req.payload_len != sizeof(struct uictl_payload_move_abs)) {
-          result = ERR_PAYLOAD_INVALID;
-          break;
+      } else if (events[i].data.fd == sfd) {
+        int cfd = accept4(sfd, NULL, NULL, SOCK_CLOEXEC);
+        if (cfd < 0) {
+          if (errno == EINTR)
+            continue;
+          perror("uictld: accept4");
+          continue;
         }
-        /* M3 will decode_move_abs(payload_buf, &mv) and write to /dev/uinput
-           here. M2: validate-and-ack stub. */
-        result = OK;
-        break;
-      default:
-        result = ERR_OPCODE_UNKNOWN;
-        break;
+
+        struct ucred cred;
+        socklen_t cred_len = sizeof(cred);
+        if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) < 0) {
+          perror("uictld: getsockopt SO_PEERCRED");
+          close(cfd);
+          continue;
+        }
+        if (cred.uid != getuid()) {
+          audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0,
+                    ERR_DENIED_BY_POLICY, "peer uid mismatch");
+          struct uictl_frame_header deny = {.version = UICTL_PROTO_VERSION,
+                                            .opcode = OP_INVALID,
+                                            .source_tag = 0,
+                                            .seq = 0,
+                                            .payload_len = sizeof(uint16_t)};
+          char deny_buf[sizeof(deny) + sizeof(uint16_t)];
+          encode_frame_header(&deny, deny_buf);
+          uint16_t deny_result = ERR_DENIED_BY_POLICY;
+          memcpy(deny_buf + sizeof(deny), &deny_result, sizeof(deny_result));
+          (void)write_full(cfd, deny_buf, sizeof(deny_buf));
+          close(cfd);
+          continue;
+        }
+
+        char hdr_buf[sizeof(struct uictl_frame_header)];
+        ssize_t rh = read_full(cfd, hdr_buf, sizeof(hdr_buf));
+        if (rh < 0) {
+          perror("uictld: read header");
+          close(cfd);
+          continue;
+        }
+        if ((size_t)rh != sizeof(hdr_buf)) {
+          fprintf(stderr, "uictld: client closed mid-header\n");
+          close(cfd);
+          continue;
+        }
+
+        struct uictl_frame_header req;
+        decode_frame_header(hdr_buf, &req);
+
+        struct uictl_frame_header resp = req;
+        resp.payload_len = sizeof(uint16_t);
+
+        uint16_t result;
+        char payload_buf[UICTL_MAX_PAYLOAD];
+
+        if (req.version != UICTL_PROTO_VERSION) {
+          result = ERR_VERSION;
+        } else if (req.payload_len > UICTL_MAX_PAYLOAD) {
+          result = ERR_TOO_LARGE;
+        } else {
+          ssize_t rp = read_full(cfd, payload_buf, req.payload_len);
+          if (rp < 0) {
+            perror("uictld: read payload");
+            close(cfd);
+            continue;
+          }
+          if ((size_t)rp != req.payload_len) {
+            fprintf(stderr, "uictld: client closed mid-payload\n");
+            close(cfd);
+            continue;
+          }
+
+          switch (req.opcode) {
+          case OP_PING:
+            result = (req.payload_len == 0) ? OK : ERR_PAYLOAD_INVALID;
+            break;
+          case OP_MOVE_ABS:
+            if (req.payload_len != sizeof(struct uictl_payload_move_abs)) {
+              result = ERR_PAYLOAD_INVALID;
+              break;
+            }
+            struct uictl_payload_move_abs mv;
+            decode_move_abs(payload_buf, &mv);
+            if (mv.x < 0)
+              mv.x = 0;
+            if (mv.x > ABS_RANGE_MAX)
+              mv.x = ABS_RANGE_MAX;
+            if (mv.y < 0)
+              mv.y = 0;
+            if (mv.y > ABS_RANGE_MAX)
+              mv.y = ABS_RANGE_MAX;
+            result =
+                (uinput_move_abs(uinput_fd, mv.x, mv.y) < 0) ? ERR_INTERNAL : 0;
+            break;
+          default:
+            result = ERR_OPCODE_UNKNOWN;
+            break;
+          }
+        }
+
+        char args_buf[64];
+        args_buf[0] = '\0';
+        if (result == OK && req.opcode == OP_MOVE_ABS) {
+          struct uictl_payload_move_abs mv;
+          decode_move_abs(payload_buf, &mv);
+          snprintf(args_buf, sizeof(args_buf), "x=%d y=%d", mv.x, mv.y);
+        }
+        audit_log(audit_fd, cred.pid, cred.uid, req.source_tag, req.opcode,
+                  req.seq, result, args_buf);
+
+        char resp_buf[sizeof(struct uictl_frame_header) + sizeof(uint16_t)];
+        encode_frame_header(&resp, resp_buf);
+        memcpy(resp_buf + sizeof(struct uictl_frame_header), &result,
+               sizeof(result));
+
+        if (write_full(cfd, resp_buf, sizeof(resp_buf)) < 0) {
+          perror("uictld: write_full");
+        }
+
+        close(cfd);
       }
     }
-
-    char args_buf[64];
-    args_buf[0] = '\0';
-    if (result == OK && req.opcode == OP_MOVE_ABS) {
-      struct uictl_payload_move_abs mv;
-      decode_move_abs(payload_buf, &mv);
-      snprintf(args_buf, sizeof(args_buf), "x=%d y=%d", mv.x, mv.y);
-    }
-    audit_log(audit_fd, cred.pid, cred.uid, req.source_tag, req.opcode,
-              req.seq, result, args_buf);
-
-    char resp_buf[sizeof(struct uictl_frame_header) + sizeof(uint16_t)];
-    encode_frame_header(&resp, resp_buf);
-    memcpy(resp_buf + sizeof(struct uictl_frame_header), &result,
-           sizeof(result));
-
-    if (write_full(cfd, resp_buf, sizeof(resp_buf)) < 0) {
-      perror("uictld: write_full");
-    }
-
-    close(cfd);
   }
 
   fprintf(stderr, "uictld: shutting down\n");
 
+  uinput_close(uinput_fd);
+  close(sigfd);
+  close(epfd);
   close(sfd);
   unlink(path);
   close(audit_fd);
