@@ -137,6 +137,23 @@ static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
 #define CONN_PARTIAL_TIMEOUT_SEC 5
 #define REAPER_TICK_SEC 1
 
+/* ---- admission + fairness (M3.7) ------------------------------------
+   How many frames one connection may have dispatched for it in a single
+   epoll_wait turn (G6), and how many concurrent connections one peer pid
+   may hold (G7).
+
+   The budget is not a rate limit — it does not slow anyone down over
+   time. It only bounds how long one connection can own the loop before
+   the others are looked at: 32 frames is one uinput write and one audit
+   write apiece, microseconds, while an unbounded drain of a 1000-frame
+   pipeline is milliseconds and blows muvor's sub-50 ms budget.
+
+   4 connections per pid is generous for every profile we know: the CLI
+   opens one and exits, muvor and auto-c hold one long-lived each. It
+   exists so a buggy or hostile peer cannot take all 32 slots. */
+#define CONN_FRAMES_PER_TURN 32
+#define MAX_CONNS_PER_PID 4
+
 enum conn_phase { CONN_WANT_HEADER, CONN_WANT_PAYLOAD };
 
 /* ---- epoll event keys ------------------------------------------------
@@ -200,6 +217,13 @@ struct conn {
      (have > 0 || phase == CONN_WANT_PAYLOAD). Read by the M3.5 task 6
      reaper; nothing consumes it yet. */
   time_t frame_since;
+
+  /* Operator introspection only (M3.7 task 4 / SIGUSR1). Deliberately
+     not policy inputs: a rate limit keyed on frames_served would be a
+     policy decision made below the identity layer, which is the mistake
+     G2 is about. accepted_at is CLOCK_MONOTONIC seconds. */
+  time_t accepted_at;
+  uint64_t frames_served;
 };
 
 static struct conn conns[MAX_CONNS];
@@ -240,9 +264,33 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     c->out_since = 0;
     c->events = EPOLLIN; /* caller registers with exactly this */
     c->frame_since = 0;
+    c->accepted_at = mono_secs();
+    c->frames_served = 0;
     return c;
   }
   return NULL; /* table full — caller refuses the connection */
+}
+
+/* How many live connections this peer pid already holds (M3.7 task 2).
+   Why *pid* and not uid: every peer is the same uid — that is invariant
+   9 — so uid discriminates nothing between two processes of this user.
+   pid comes from SO_PEERCRED, is captured by the kernel at accept, and
+   cannot be forged by the client. It is not a stable identity (pids get
+   recycled), but that does not matter for a cap on *concurrently open*
+   connections: the only question is how many live conns share this pid
+   right now, and a recycled pid means the old ones are long closed.
+
+   pid 0 is not special-cased. SO_PEERCRED reports 0 when the peer lives
+   in another pid namespace or has already exited, so all such peers do
+   share one bucket of 4 — a real but tiny unfairness. The alternative,
+   exempting pid 0 from the cap, is an unbounded hole reachable by any
+   peer that can arrange to look unmappable. Prefer the unfairness. */
+static int conn_count_pid(pid_t pid) {
+  int n = 0;
+  for (int i = 0; i < MAX_CONNS; i++)
+    if (conns[i].fd >= 0 && conns[i].cred.pid == pid)
+      n++;
+  return n;
 }
 
 static uint64_t conn_evkey(const struct conn *c) {
@@ -456,13 +504,26 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
   conn_reply(c, result);
 }
 
-/* Drain everything readable on this connection, dispatching each frame
-   as it completes. Exact-size reads: we ask for precisely the bytes the
-   current phase still needs, so a read can never overshoot into the
-   next frame and there is no leftover tail to compact. Pipelined frames
-   still work — the loop simply comes back around. */
+/* Drain what is readable on this connection, dispatching each frame as
+   it completes, up to CONN_FRAMES_PER_TURN frames. Exact-size reads: we
+   ask for precisely the bytes the current phase still needs, so a read
+   can never overshoot into the next frame and there is no leftover tail
+   to compact. Pipelined frames still work — the loop simply comes back
+   around, and past the budget the *next* epoll turn comes back around.
+
+   The budget (M3.7 task 1, G6) is what makes the scheduling unit "one
+   frame" instead of "one connection's whole backlog". Returning early
+   with bytes still sitting in the receive buffer IS the round-robin:
+   epoll here is level-triggered, so this connection is re-reported as
+   readable on the very next turn, after every other ready fd has had
+   theirs. The kernel's readiness list is the queue — no scheduler, no
+   priority queue, no fairness counter to keep consistent. (Third thing
+   level-triggered mode gives us for free, after re-arming EPOLLIN post
+   EPOLLOUT stall and never having to remember "there may be more".) */
 static void conn_readable(int epfd, struct conn *c, int uinput_fd,
                           int audit_fd) {
+  unsigned dispatched = 0;
+
   for (;;) {
     while (c->have < c->want) {
       ssize_t r = read(c->fd, c->buf + c->have, c->want - c->have);
@@ -544,6 +605,17 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
        frame here would clobber the reply still in flight. */
     if (conn_after_flush(epfd, c, flushed) < 0)
       return;
+
+    /* Counted here, per *dispatched frame* — not per read() and not per
+       loop iteration. A frame trickling in across five reads is still
+       one frame's worth of work; charging it five would let a slow but
+       honest client spend its budget on nothing and yield a turn for
+       every fragment. Nothing else is needed on the way out: EPOLLIN is
+       still armed (conn_after_flush only drops it while a reply is
+       pending), so the leftover bytes come back to us next turn. */
+    c->frames_served++;
+    if (++dispatched >= CONN_FRAMES_PER_TURN)
+      return;
   }
 }
 
@@ -604,6 +676,54 @@ static void conn_reap_partial(int epfd, int audit_fd) {
   }
 }
 
+/* SIGUSR1 handler body (M3.7 task 4 / G10): what the operator gets
+   instead of grepping an append-only log to answer "who is connected and
+   who is being refused". Deliberately stderr and not a new opcode:
+   open question 4 leans against exposing peer identities *to clients*
+   (an information leak between peers of the same user), and that
+   objection does not apply to the operator running the daemon.
+
+   Everything here is metadata — pids, phases, counters. No payload
+   bytes, no coordinates, nothing that would become keystrokes at M4.
+   That is security rule 5's "intent, not content" applied to a channel
+   the rule was not written for; keep it that way when adding fields.
+
+   Called straight from the event loop, not from a signal handler, so
+   fprintf is safe. That is the whole reason signalfd exists: an
+   async-signal handler could not do any of this. */
+static void conn_dump_table(void) {
+  time_t now = mono_secs();
+  int used = 0;
+  for (int i = 0; i < MAX_CONNS; i++)
+    if (conns[i].fd >= 0)
+      used++;
+
+  fprintf(stderr, "uictld: %d/%d slots used (max %d per pid)\n", used,
+          MAX_CONNS, MAX_CONNS_PER_PID);
+  for (int i = 0; i < MAX_CONNS; i++) {
+    const struct conn *c = &conns[i];
+    if (c->fd < 0)
+      continue;
+
+    /* Same distinction the reaper makes: "idle" is a resting long-lived
+       client, "hdr"/"payload" mean bytes are outstanding and the reap
+       clock is running. Printing them apart is the point — it is what
+       tells an operator whether a quiet connection is healthy or stuck. */
+    const char *phase = !conn_frame_in_progress(c) ? "idle"
+                        : c->phase == CONN_WANT_PAYLOAD
+                            ? "payload"
+                            : "hdr";
+    fprintf(stderr,
+            "  slot=%2d gen=%u fd=%d pid=%d uid=%u phase=%s(%zu/%zu) "
+            "reply=%zu/%zu age=%llds frames=%llu\n",
+            i, c->generation, c->fd, (int)c->cred.pid, (unsigned)c->cred.uid,
+            phase, c->have, c->want, c->out_sent, c->out_len,
+            (long long)(now - c->accepted_at),
+            (unsigned long long)c->frames_served);
+  }
+  fflush(stderr);
+}
+
 int main(void) {
 
   const char *xdg = getenv("XDG_RUNTIME_DIR");
@@ -637,6 +757,13 @@ int main(void) {
   sigemptyset(&mask);
   sigaddset(&mask, SIGINT);
   sigaddset(&mask, SIGTERM);
+  /* SIGUSR1 is the operator's "who is connected?" (M3.7 task 4). It has
+     to be in this set for two reasons, and the second one is the sharp
+     one: signalfd only ever reports signals that are BLOCKED, and the
+     default disposition of SIGUSR1 is *terminate the process*. Add it to
+     the signalfd mask but forget it here and `kill -USR1 $(pidof uictld)`
+     kills the daemon instead of printing a table. */
+  sigaddset(&mask, SIGUSR1);
   if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0) {
     perror("uictld: sigprocmask");
     close(sfd);
@@ -810,11 +937,24 @@ int main(void) {
 
       if (is_static && skey == sigfd) {
         struct signalfd_siginfo si;
-        if (read(sigfd, &si, sizeof(si)) == (ssize_t)sizeof(si))
-          fprintf(stderr, "uictld: signal %u, shutting down\n", si.ssi_signo);
-        else
+        if (read(sigfd, &si, sizeof(si)) != (ssize_t)sizeof(si)) {
+          /* Can't tell what arrived. Shutting down is the safe reading:
+             the alternative is ignoring a SIGTERM. */
           perror("uictld: read signalfd");
+          stop = 1;
+          break;
+        }
 
+        /* Not every signal is a shutdown — this branch used to assume
+           so. One siginfo is consumed per event; if several signals are
+           pending the fd stays readable (level-triggered) and we come
+           back for the rest, so `continue` here loses nothing. */
+        if (si.ssi_signo == SIGUSR1) {
+          conn_dump_table();
+          continue;
+        }
+
+        fprintf(stderr, "uictld: signal %u, shutting down\n", si.ssi_signo);
         stop = 1;
         break;
       } else if (is_static && skey == tfd) {
@@ -859,14 +999,33 @@ int main(void) {
             continue;
           }
 
+          /* Per-pid cap before the table cap, so a peer that is already
+             at its own limit is told so specifically. Both are ERR_BUSY:
+             from the client's side both mean "no slot for you right now,
+             try again", which is exactly what ERR_BUSY promises and what
+             ERR_DENIED_BY_POLICY (terminal) must not be used for.
+
+             The M3.5 reaper cannot substitute for this check and that is
+             deliberate, not an oversight: decision 2 defines an idle
+             connection with no frame in progress as well-behaved, so 32
+             idle connections from one pid are, by the daemon's own
+             rules, 32 innocent connections. This is the only thing that
+             stops them from being all of them. */
+          if (conn_count_pid(cred.pid) >= MAX_CONNS_PER_PID) {
+            audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0,
+                      ERR_BUSY, "per-pid conn cap");
+            deny_and_close(cfd, ERR_BUSY);
+            continue;
+          }
+
           struct conn *c = conn_alloc(cfd, &cred);
           if (!c) {
-            /* Task 3: hard cap. We still accept() and close() rather
-               than leaving it queued — an unaccepted connection keeps
-               the listening socket readable forever. */
-            audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0,
-                      ERR_DENIED_BY_POLICY, "conn table full");
-            deny_and_close(cfd, ERR_DENIED_BY_POLICY);
+            /* M3.5 task 3: hard global cap. We still accept() and
+               close() rather than leaving it queued — an unaccepted
+               connection keeps the listening socket readable forever. */
+            audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0, ERR_BUSY,
+                      "conn table full");
+            deny_and_close(cfd, ERR_BUSY);
             continue;
           }
 

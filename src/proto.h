@@ -13,6 +13,20 @@
 #define UICTL_MAX_PAYLOAD 4096
 
 enum uictl_op { OP_INVALID = 0, OP_PING, OP_MOVE_ABS };
+
+/* Result codes are ON THE WIRE. Append only — never insert, never
+   reorder. A client built against an older header must keep decoding
+   every code it already knows to the same meaning.
+
+   Two classes, and a client library needs to tell them apart to have a
+   sane reconnect policy (M3.7 task 3 / G8):
+     terminal  — retrying changes nothing. ERR_DENIED_BY_POLICY (your
+                 uid is wrong), ERR_VERSION, ERR_OPCODE_UNKNOWN,
+                 ERR_PAYLOAD_INVALID, ERR_TOO_LARGE.
+     retryable — the daemon is momentarily out of room. ERR_BUSY only.
+   Before ERR_BUSY existed, "table full" and "wrong uid" were the same
+   code, so a client had to either hammer a daemon that told it to go
+   away or give up on a condition that clears in milliseconds. */
 enum uictl_result {
   OK = 0,
   ERR_VERSION,
@@ -20,7 +34,8 @@ enum uictl_result {
   ERR_PAYLOAD_INVALID,
   ERR_DENIED_BY_POLICY,
   ERR_TOO_LARGE,
-  ERR_INTERNAL
+  ERR_INTERNAL,
+  ERR_BUSY /* retryable: no connection slot right now */
 };
 
 #define SRC_CLI (1u << 0)
