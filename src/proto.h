@@ -39,7 +39,14 @@
    contract, and it must not claim a key can be pressed before one can.
    See plan.md §"v0.2 Milestone 4" for why policy lands before the
    injection path rather than after. */
-enum uictl_op { OP_INVALID = 0, OP_PING, OP_MOVE_ABS, OP_HELLO, OP_KEY_TAP };
+enum uictl_op {
+  OP_INVALID = 0,
+  OP_PING,
+  OP_MOVE_ABS,
+  OP_HELLO,
+  OP_KEY_TAP,
+  OP_KEY_SEQUENCE
+};
 
 /* Result codes are ON THE WIRE. Append only — never insert, never
    reorder. A client built against an older header must keep decoding
@@ -49,7 +56,12 @@ enum uictl_op { OP_INVALID = 0, OP_PING, OP_MOVE_ABS, OP_HELLO, OP_KEY_TAP };
    a sane reconnect policy (M3.7 task 3 / G8):
      terminal    — retrying changes nothing. ERR_DENIED_BY_POLICY (your
                    uid is wrong), ERR_VERSION, ERR_OPCODE_UNKNOWN,
-                   ERR_PAYLOAD_INVALID, ERR_TOO_LARGE.
+                   ERR_PAYLOAD_INVALID, ERR_TOO_LARGE,
+                   ERR_KEY_DENYLISTED (never, by design).
+     fixable     — retrying identically fails, but a stated change to
+                   local configuration makes it work.
+                   ERR_KEY_NOT_ALLOWED: add the keycode to
+                   ~/.config/uictl/policy and restart the daemon.
      retryable   — the daemon is momentarily out of room. ERR_BUSY only.
      correctable — the request was fine, the connection wasn't ready.
                    ERR_HANDSHAKE_REQUIRED: send OP_HELLO on this same
@@ -65,8 +77,34 @@ enum uictl_result {
   ERR_DENIED_BY_POLICY,
   ERR_TOO_LARGE,
   ERR_INTERNAL,
-  ERR_BUSY,               /* retryable: no connection slot right now */
-  ERR_HANDSHAKE_REQUIRED  /* correctable: send OP_HELLO, then retry */
+  ERR_BUSY,                /* retryable: no connection slot right now */
+  ERR_HANDSHAKE_REQUIRED,  /* correctable: send OP_HELLO, then retry */
+
+  /* The two key refusals are separate codes, not one, because they call
+     for opposite responses from whoever hit them:
+
+       ERR_KEY_DENYLISTED  — a destructive key. Static, in the daemon,
+                             NOT overridable by configuration. Telling a
+                             user "edit your policy file" here would send
+                             them to do something that cannot work.
+       ERR_KEY_NOT_ALLOWED — simply absent from ~/.config/uictl/policy.
+                             One line of config away from working.
+
+     A client that cannot distinguish them can only print "denied", which
+     leaves the user to guess which of the two situations they are in.
+     That guess is the whole difference between "add a line to a file"
+     and "this will never work, do something else". */
+  ERR_KEY_DENYLISTED,
+  ERR_KEY_NOT_ALLOWED,
+
+  /* Separate from ERR_BUSY on purpose. ERR_BUSY says the daemon has no
+     room and the client should retry shortly — nothing about the client
+     was wrong. This says the client is going faster than its class
+     allows, and the fix is to *pace itself*, not to retry harder.
+     A library that conflated them would answer a rate limit with a
+     retry storm, which is the one response guaranteed to make it
+     worse. Retryable, after a wait. */
+  ERR_RATE_LIMITED
 };
 
 /* ---- source_tag: ADVISORY METADATA ONLY (M3.6 task 6) ---------------
@@ -189,6 +227,48 @@ struct uictl_payload_key {
 
 _Static_assert(sizeof(struct uictl_payload_key) == 2,
                "KEY_TAP payload must be exactly 2 bytes");
+
+/* KEY_SEQUENCE (M4 step 9): several key transitions applied atomically,
+   under a single SYN_REPORT. This is what modifier+key needs — Ctrl+A is
+   `down 29, down 30, up 30, up 29`, and a client that had to send four
+   separate requests could be interrupted between any two of them.
+
+   **Every sequence must be self-balancing**: each press has its matching
+   release inside the same request, and the daemon refuses one that is
+   not. That is what makes this shippable while OP_KEY_DOWN/OP_KEY_UP are
+   still blocked on M4.5 — a request cannot leave a key held, so there is
+   no orphaned kernel state for a dying client to strand. A stuck Ctrl
+   when your input broker is the wedged thing is genuinely unpleasant to
+   recover from; refusing to create the possibility is cheaper than
+   cleaning it up.
+
+   Layout: `{u16 count, u16 reserved}` then exactly `count` items of
+   `{u16 keycode, u8 value, u8 reserved}`, so payload_len is exactly
+   4 + 4*count. Both reserved fields MUST be zero — they are wire space
+   the daemon reads and rejects rather than ignores, so a future field
+   cannot collide with junk an old client happened to send. */
+#define UICTL_SEQ_MAX 16
+
+struct uictl_seq_item {
+  uint16_t keycode;
+  uint8_t value; /* 1 = press, 0 = release. nothing else. */
+  uint8_t reserved;
+};
+
+struct uictl_payload_key_seq {
+  uint16_t count;
+  uint16_t reserved;
+};
+
+_Static_assert(sizeof(struct uictl_seq_item) == 4,
+               "sequence item must be exactly 4 bytes");
+_Static_assert(sizeof(struct uictl_payload_key_seq) == 4,
+               "sequence header must be exactly 4 bytes");
+
+static inline size_t uictl_seq_payload_len(uint16_t count) {
+  return sizeof(struct uictl_payload_key_seq) +
+         (size_t)count * sizeof(struct uictl_seq_item);
+}
 
 /* What the daemon can do, answered in the HELLO response (M3.6 task 3).
    Capability bits describe the *device*, opcode bits describe the

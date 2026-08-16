@@ -30,6 +30,8 @@ static const char *opname(uint16_t op) {
     return "MOVE_ABS";
   case OP_HELLO:
     return "HELLO";
+  case OP_KEY_SEQUENCE:
+    return "KEY_SEQUENCE";
   case OP_KEY_TAP:
     /* Named before it is implemented, on purpose. Until step 5 a
        KEY_TAP frame is refused with ERR_OPCODE_UNKNOWN — and the audit
@@ -286,8 +288,180 @@ static void load_client_registry(void) {
   }
 }
 
+/* ---- key allowlist (M4 step 8) --------------------------------------
+   The default-deny half of the keyboard policy. A keycode must pass BOTH
+   lists to be injected:
+
+     deny-list   static, in the platform layer, destructive keys. Cannot
+                 be overridden by configuration — that is the point of it
+                 being static.
+     allowlist   this. Per-user, from ~/.config/uictl/policy. Absent,
+                 empty, or unreadable means **no keys at all**.
+
+   Strict by choice (user's call, 2026-08-16). "Absent file means the
+   deny-list alone governs" would be friendlier and weaker: a fresh
+   install, or a typo'd path, would silently grant every non-destructive
+   key on the keyboard. Default-deny means the failure mode of a missing
+   or misspelled config is "nothing works", which is loud, safe, and
+   fixable — the opposite of a security hole you never notice.
+
+   A bitset rather than ranges: lookups happen per request, the whole
+   keyspace is 768 bits (96 bytes), and unlike the deny-list this table
+   is built from user input where "one entry shadows another" would be a
+   real hazard. Set-membership has no ordering to get wrong. */
+#define ALLOW_BITS_BYTES ((UINPUT_KEY_CODE_MAX / 8) + 1)
+static unsigned char key_allow_bits[ALLOW_BITS_BYTES];
+static int key_allow_count;
+
+static void key_allow_set(uint16_t code) {
+  if (code <= UINPUT_KEY_CODE_MAX &&
+      !(key_allow_bits[code / 8] & (1u << (code % 8)))) {
+    key_allow_bits[code / 8] |= (unsigned char)(1u << (code % 8));
+    key_allow_count++;
+  }
+}
+
+static int key_allowed(uint16_t code) {
+  if (code > UINPUT_KEY_CODE_MAX)
+    return 0;
+  return (key_allow_bits[code / 8] & (1u << (code % 8))) != 0;
+}
+
+/* Parse `lo` or `lo-hi`. Returns 0 on success. Rejects anything the
+   keyspace cannot hold, so a typo becomes a reported line rather than a
+   silently empty range. */
+static int parse_key_range(const char *tok, unsigned *lo, unsigned *hi) {
+  char *end;
+  errno = 0;
+  unsigned long a = strtoul(tok, &end, 10);
+  if (errno != 0 || end == tok)
+    return -1;
+  unsigned long b = a;
+  if (*end == '-') {
+    const char *p = end + 1;
+    errno = 0;
+    b = strtoul(p, &end, 10);
+    if (errno != 0 || end == p)
+      return -1;
+  }
+  if (*end != '\0')
+    return -1;
+  if (a < 1 || b < a || b > UINPUT_KEY_CODE_MAX)
+    return -1;
+  *lo = (unsigned)a;
+  *hi = (unsigned)b;
+  return 0;
+}
+
+/* Read ~/.config/uictl/policy: one keycode or `lo-hi` range per line,
+   `#` comments, blanks ignored. Same ownership posture as the audit log
+   and the client registry — this file decides what may be typed into the
+   user's session, so another user being able to write it would be the
+   whole game.
+
+   Loaded once at startup, like the client registry, and for the same
+   reason: policy that changes mid-session is policy nobody can audit
+   afterwards. */
+static void load_key_policy(void) {
+  const char *home = getenv("HOME");
+  char path[256];
+  if (!home)
+    return;
+  int n = snprintf(path, sizeof(path), "%s/.config/uictl/policy", home);
+  if (n < 0 || (size_t)n >= sizeof(path))
+    return;
+
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno != ENOENT)
+      perror("uictld: open key policy");
+    fprintf(stderr,
+            "uictld: no key policy at %s — ALL key injection will be "
+            "refused (default-deny)\n",
+            path);
+    return;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+      (st.st_mode & 0077)) {
+    /* Ignored entirely, not partially honoured — and under default-deny
+       that means no keys, which is the safe direction to fail. */
+    fprintf(stderr,
+            "uictld: %s must be a regular file owned by this uid with no "
+            "group/world bits — ignoring it, ALL key injection refused\n",
+            path);
+    close(fd);
+    return;
+  }
+
+  char buf[REGISTRY_MAX_BYTES + 1];
+  ssize_t got = read_full(fd, buf, REGISTRY_MAX_BYTES);
+  close(fd);
+  if (got < 0) {
+    perror("uictld: read key policy");
+    return;
+  }
+  buf[got] = '\0';
+
+  int line_no = 0, shadowed = 0;
+  uint16_t first_shadowed = 0;
+  /* By hand, not strtok_r: it collapses blank lines and would misreport
+     every line number after the first empty one. Same fix as the client
+     registry loader. */
+  for (char *p = buf; *p;) {
+    char *line = p;
+    char *eol = strchr(p, '\n');
+    if (eol) {
+      *eol = '\0';
+      p = eol + 1;
+    } else {
+      p += strlen(p);
+    }
+    line_no++;
+
+    char *hash = strchr(line, '#');
+    if (hash)
+      *hash = '\0';
+
+    char *save = NULL;
+    for (const char *tok = strtok_r(line, " \t\r", &save); tok;
+         tok = strtok_r(NULL, " \t\r", &save)) {
+      unsigned lo, hi;
+      if (parse_key_range(tok, &lo, &hi) < 0) {
+        fprintf(stderr,
+                "uictld: key policy line %d: '%s' is not a keycode or "
+                "lo-hi range within 1..%d\n",
+                line_no, tok, UINPUT_KEY_CODE_MAX);
+        continue;
+      }
+      for (unsigned code = lo; code <= hi; code++) {
+        /* Telling the user their entry is dead is worth four lines: an
+           allowlist entry the deny-list overrides looks like it works
+           until the day someone needs it. The deny-list wins — it is
+           static precisely so config cannot unlock it. */
+        if (uinput_keycode_denied((uint16_t)code, NULL)) {
+          if (!shadowed)
+            first_shadowed = (uint16_t)code;
+          shadowed++;
+          continue;
+        }
+        key_allow_set((uint16_t)code);
+      }
+    }
+  }
+
+  if (shadowed)
+    fprintf(stderr,
+            "uictld: key policy: %d allowed code(s) are on the static "
+            "deny-list and stay denied (first: %u)\n",
+            shadowed, first_shadowed);
+  fprintf(stderr, "uictld: key policy: %d keycode(s) allowed\n",
+          key_allow_count);
+}
+
 /* Unregistered name -> the floor. Default-deny, same posture M4's
-   keyboard allowlist will take. */
+   keyboard allowlist takes. */
 static enum client_class class_for_name(const char *name) {
   for (int i = 0; i < registry_len; i++)
     if (strcmp(registry[i].name, name) == 0)
@@ -524,6 +698,166 @@ static int conn_count_pid(pid_t pid) {
     if (conns[i].fd >= 0 && conns[i].cred.pid == pid)
       n++;
   return n;
+}
+
+/* ---- rate limiting (M4 step 10) -------------------------------------
+   A token bucket per peer **pid**, sized by the peer's **class**.
+
+   Why pid and not connection: a per-connection bucket is multiplied by
+   however many connections a client opens (up to MAX_CONNS_PER_PID = 4),
+   which turns the limit into a suggestion. Why pid and not `source_tag`:
+   that is G2 — the client picks the field, so it would pick its own
+   limit. pid comes from SO_PEERCRED and cannot be forged.
+
+   The bucket survives disconnect: it is keyed on pid and reclaimed only
+   when that pid has no live connection AND its slot is needed. Otherwise
+   reconnecting would reset the budget, and "close and reopen the socket"
+   would be a rate-limit bypass anyone would find in an afternoon.
+
+   Integer milli-tokens, not floats: exact, and the daemon has no other
+   floating point in it. RATE_UNIT milli-tokens is one request. */
+#define RATE_UNIT 1000
+#define RATE_BUCKETS MAX_CONNS
+
+struct rate_class {
+  unsigned per_sec; /* sustained rate  */
+  unsigned burst;   /* bucket capacity */
+};
+
+/* Indexed by enum client_class. The untrusted floor is what an
+   unregistered client gets — and what the v2.x LLM agent will get until
+   someone writes it into the registry deliberately. plan.md's original
+   sketch was CLI 50 / HOTKEY 20 / LLM 5; the tiers survive, but they are
+   now attached to a class the daemon derives rather than to a number the
+   client sends. */
+static const struct rate_class rate_classes[CLASS__COUNT] = {
+    [CLASS_UNTRUSTED] = {5, 5},
+    [CLASS_STANDARD] = {20, 20},
+    [CLASS_INTERACTIVE] = {50, 50},
+};
+
+struct rate_bucket {
+  pid_t pid;
+  int used;
+  unsigned milli;  /* tokens * RATE_UNIT */
+  long last_ms;    /* CLOCK_MONOTONIC ms at the last refill */
+};
+
+static struct rate_bucket rate_buckets[RATE_BUCKETS];
+
+/* The backstop, and it exists because per-pid alone is bypassable:
+   **fork per request and every request gets a fresh bucket.** The CLI
+   does exactly that by accident — one process per invocation — and a
+   hostile client can do it on purpose for the cost of a spawn.
+
+   A daemon-wide bucket bounds total device traffic no matter how many
+   pids appear. It is sized well above the sum of the intended clients
+   (muvor 50/s + auto-c 20/s + occasional CLI) so it never shapes normal
+   use; it is a ceiling on the pathological case, not a second tier.
+
+   Every peer is the same uid (invariant 9), so daemon-wide and uid-wide
+   are the same thing here. */
+#define RATE_GLOBAL_PER_SEC 200
+#define RATE_GLOBAL_BURST 200
+static const struct rate_class rate_global_class = {RATE_GLOBAL_PER_SEC,
+                                                    RATE_GLOBAL_BURST};
+static struct rate_bucket rate_global = {0, 1, RATE_GLOBAL_BURST * RATE_UNIT,
+                                         0};
+
+static long mono_msecs(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+    return 0;
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Is any live connection owned by this pid? Used to decide which bucket
+   may be recycled. */
+static int pid_has_conn(pid_t pid) {
+  for (int i = 0; i < MAX_CONNS; i++)
+    if (conns[i].fd >= 0 && conns[i].cred.pid == pid)
+      return 1;
+  return 0;
+}
+
+static struct rate_bucket *rate_bucket_for(pid_t pid, const struct rate_class *rc) {
+  for (int i = 0; i < RATE_BUCKETS; i++)
+    if (rate_buckets[i].used && rate_buckets[i].pid == pid)
+      return &rate_buckets[i];
+
+  struct rate_bucket *slot = NULL;
+  for (int i = 0; i < RATE_BUCKETS; i++)
+    if (!rate_buckets[i].used) {
+      slot = &rate_buckets[i];
+      break;
+    }
+  if (!slot) {
+    /* Full: reclaim a bucket whose pid is gone. Never steal one that is
+       still in use, or two clients would share a budget. */
+    for (int i = 0; i < RATE_BUCKETS; i++)
+      if (!pid_has_conn(rate_buckets[i].pid)) {
+        slot = &rate_buckets[i];
+        break;
+      }
+  }
+  if (!slot)
+    return NULL; /* caller treats this as "no budget": fail closed */
+
+  slot->pid = pid;
+  slot->used = 1;
+  slot->milli = rc->burst * RATE_UNIT; /* a new client starts full */
+  slot->last_ms = mono_msecs();
+  return slot;
+}
+
+/* Bring one bucket up to date. Refill is computed lazily from elapsed
+   time rather than on a timer: nothing to schedule, nothing to drift,
+   and an idle client costs zero work. */
+static void bucket_refill(struct rate_bucket *b, const struct rate_class *rc,
+                          long now) {
+  long elapsed = now - b->last_ms;
+  if (elapsed <= 0) {
+    /* Clock went backwards (or no time passed): refill nothing, and
+       never punish — a client must not lose budget because of NTP. */
+    if (elapsed < 0)
+      b->last_ms = now;
+    return;
+  }
+  unsigned long add = (unsigned long)elapsed * rc->per_sec;
+  unsigned long cap = (unsigned long)rc->burst * RATE_UNIT;
+  unsigned long total = (unsigned long)b->milli + add;
+  b->milli = (unsigned)(total > cap ? cap : total);
+  b->last_ms = now;
+}
+
+/* Take `cost` requests worth of budget from BOTH buckets, or refuse.
+   `*global_out` reports which limit bit, for the audit line.
+
+   Both are checked before either is charged: a request refused by the
+   global ceiling must not still burn the client's own budget, or a busy
+   daemon would silently throttle innocent clients twice over. */
+static int rate_allow(pid_t pid, enum client_class cl, unsigned cost,
+                      int *global_out) {
+  const struct rate_class *rc = &rate_classes[cl];
+  struct rate_bucket *b = rate_bucket_for(pid, rc);
+  if (!b)
+    return 0;
+
+  long now = mono_msecs();
+  bucket_refill(b, rc, now);
+  bucket_refill(&rate_global, &rate_global_class, now);
+
+  unsigned need = cost * RATE_UNIT;
+  if (rate_global.milli < need) {
+    *global_out = 1;
+    return 0;
+  }
+  if (b->milli < need)
+    return 0;
+
+  b->milli -= need;
+  rate_global.milli -= need;
+  return 1;
 }
 
 static uint64_t conn_evkey(const struct conn *c) {
@@ -770,7 +1104,8 @@ static struct uictl_resp_hello daemon_capabilities(uint16_t proto_selected) {
          is the contract, and it may only advertise what is fully wired —
          validated, gated by the deny-list, and actually injected. */
       .opcode_bitmap = UICTL_OP_BIT(OP_PING) | UICTL_OP_BIT(OP_MOVE_ABS) |
-                       UICTL_OP_BIT(OP_HELLO) | UICTL_OP_BIT(OP_KEY_TAP),
+                       UICTL_OP_BIT(OP_HELLO) | UICTL_OP_BIT(OP_KEY_TAP) |
+                       UICTL_OP_BIT(OP_KEY_SEQUENCE),
       .daemon_version = UICTL_DAEMON_VERSION,
       .reserved = 0,
   };
@@ -836,6 +1171,60 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
      through the handshake, because that is where the class M4's policy
      reads gets derived. Without this, a client skips HELLO and operates
      at whatever the un-negotiated default is, forever. */
+  /* Rate limit (M4 step 10), charged only for requests that reach the
+     device. PING and HELLO are free: a liveness probe and a handshake
+     are how a client finds out it is being limited, and making them
+     cost budget would mean a throttled client cannot ask why. That is
+     the same reasoning that exempts PING from the handshake.
+
+     Cost: one unit per device request, except a sequence, which costs
+     one per *press* — a 16-key combo is sixteen keystrokes and pretending
+     otherwise would make the sequence opcode a way around the limit.
+
+     Charged BEFORE validation deliberately: a client hammering the
+     daemon with malformed frames is still hammering it, and a limiter
+     that only counts well-formed requests does not limit the case you
+     most want limited. */
+  if (c->hdr.opcode == OP_MOVE_ABS || c->hdr.opcode == OP_KEY_TAP ||
+      c->hdr.opcode == OP_KEY_SEQUENCE) {
+    unsigned cost = 1;
+    if (c->hdr.opcode == OP_KEY_SEQUENCE &&
+        c->hdr.payload_len >= sizeof(struct uictl_payload_key_seq)) {
+      struct uictl_payload_key_seq peek;
+      memcpy(&peek, c->buf, sizeof(peek));
+      if (peek.count > 0 && peek.count <= UICTL_SEQ_MAX &&
+          c->hdr.payload_len == uictl_seq_payload_len(peek.count)) {
+        unsigned presses = 0;
+        for (uint16_t i = 0; i < peek.count; i++) {
+          struct uictl_seq_item it;
+          memcpy(&it, c->buf + sizeof(peek) + (size_t)i * sizeof(it),
+                 sizeof(it));
+          if (it.value == 1)
+            presses++;
+        }
+        if (presses)
+          cost = presses;
+      }
+    }
+    int global_trip = 0;
+    if (!rate_allow(c->cred.pid, c->cl, cost, &global_trip)) {
+      /* Naming which limit tripped matters: "your class is 5/s" and
+         "the daemon as a whole is saturated" call for different
+         responses, and only one of them is about this client. */
+      if (global_trip)
+        snprintf(args, sizeof(args),
+                 "rate limited (daemon-wide %u/s, cost=%u)",
+                 (unsigned)RATE_GLOBAL_PER_SEC, cost);
+      else
+        snprintf(args, sizeof(args), "rate limited (class=%s, %u/s, cost=%u)",
+                 class_name(c->cl), rate_classes[c->cl].per_sec, cost);
+      audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
+                c->hdr.opcode, c->hdr.seq, ERR_RATE_LIMITED, args);
+      conn_reply(c, ERR_RATE_LIMITED);
+      return;
+    }
+  }
+
   if (!c->hello_seen && c->hdr.opcode != OP_HELLO &&
       c->hdr.opcode != OP_PING) {
     audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
@@ -967,8 +1356,8 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
   }
   case OP_KEY_TAP: {
     /* The full path, in the order the milestone built it: size check
-       (step 5), range check (step 5), deny-list (step 6), inject
-       (step 7). Nothing was ever reachable before the check above it
+       (step 5), range check (step 5), deny-list (step 6), allowlist
+       (step 8), inject (step 7). Nothing was ever reachable before the check above it
        existed — that ordering is why no build in this milestone's
        history could turn a socket into an arbitrary keystroke.
 
@@ -1007,12 +1396,25 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     const char *why = NULL;
     if (uinput_keycode_denied(key.keycode, &why)) {
       snprintf(args, sizeof(args), "code=%u denied (%s)", key.keycode, why);
-      result = ERR_DENIED_BY_POLICY;
+      result = ERR_KEY_DENYLISTED;
+      break;
+    }
+
+    /* Default-deny (M4 step 8). Checked after the deny-list so that a
+       destructive key reports the specific reason it is forbidden
+       rather than the generic "not allowed" — the audit line should say
+       *why*, and "power" is more use than "absent from a config file".
+       Both answer ERR_DENIED_BY_POLICY: to the client they are the same
+       kind of no. */
+    if (!key_allowed(key.keycode)) {
+      snprintf(args, sizeof(args), "code=%u not in allowlist", key.keycode);
+      result = ERR_KEY_NOT_ALLOWED;
       break;
     }
 
     /* M4 step 7: the injection, and note where it sits — *after* the
-       size check, the range check and the deny-list, and nowhere else.
+       size check, the range check, the deny-list and the allowlist, and
+       nowhere else.
        There is exactly one call site, so "which keys can reach the
        device" is answerable by reading the lines above it.
 
@@ -1023,6 +1425,129 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
        when the write failed would be worse than a late one. */
     snprintf(args, sizeof(args), "code=%u", key.keycode);
     result = (uinput_key_tap(uinput_fd, key.keycode) < 0) ? ERR_INTERNAL : OK;
+    break;
+  }
+  case OP_KEY_SEQUENCE: {
+    /* Same gate order as KEY_TAP, applied to every item before ANY of
+       them is written: size, range, deny-list, allowlist, balance — then
+       one atomic frame. Validating the whole sequence first is the
+       point. A per-item "check then write" loop would leave a rejected
+       modifier's press already delivered, which is the stuck-key
+       scenario arriving through the back door. */
+    if (c->hdr.payload_len < sizeof(struct uictl_payload_key_seq)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_key_seq hdr;
+    memcpy(&hdr, c->buf, sizeof(hdr));
+    if (hdr.reserved != 0 || hdr.count == 0 || hdr.count > UICTL_SEQ_MAX ||
+        c->hdr.payload_len != uictl_seq_payload_len(hdr.count)) {
+      snprintf(args, sizeof(args), "bad sequence header count=%u len=%u",
+               hdr.count, c->hdr.payload_len);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+
+    struct uinput_key_event evs[UICTL_SEQ_MAX];
+    /* Which keycodes this request currently holds down, in order. Small
+       and linear on purpose: 16 items maximum, and a bitmap would lose
+       the ordering that makes the release check readable. */
+    uint16_t held[UICTL_SEQ_MAX];
+    int held_n = 0;
+    uint16_t seq_result = OK;
+    args[0] = '\0';
+
+    /* PASS 1 — structure and balance, before any policy question.
+       Order matters for the message the user gets: an unbalanced request
+       that also names an unlisted key should report the malformed
+       sequence, not the policy miss. Otherwise they edit their policy
+       file, retry, and meet the real error only on the second attempt. */
+    for (uint16_t i = 0; i < hdr.count && seq_result == OK; i++) {
+      struct uictl_seq_item item;
+      memcpy(&item, c->buf + sizeof(hdr) + (size_t)i * sizeof(item),
+             sizeof(item));
+
+      if (item.reserved != 0 || item.value > 1) {
+        snprintf(args, sizeof(args), "item %u malformed", i);
+        seq_result = ERR_PAYLOAD_INVALID;
+        break;
+      }
+      if (item.keycode == 0 || item.keycode > UINPUT_KEY_CODE_MAX) {
+        snprintf(args, sizeof(args), "item %u code=%u out of range", i,
+                 item.keycode);
+        seq_result = ERR_PAYLOAD_INVALID;
+        break;
+      }
+
+      /* Balance, tracked as we go. A press of something already held or
+         a release of something not held is a client bug, and letting it
+         through would make "balanced at the end" arithmetic rather than
+         a real statement about the key's state. */
+      int at = -1;
+      for (int j = 0; j < held_n; j++)
+        if (held[j] == item.keycode)
+          at = j;
+      if (item.value == 1) {
+        if (at >= 0) {
+          snprintf(args, sizeof(args), "item %u presses held code=%u", i,
+                   item.keycode);
+          seq_result = ERR_PAYLOAD_INVALID;
+          break;
+        }
+        held[held_n++] = item.keycode;
+      } else {
+        if (at < 0) {
+          snprintf(args, sizeof(args), "item %u releases unheld code=%u", i,
+                   item.keycode);
+          seq_result = ERR_PAYLOAD_INVALID;
+          break;
+        }
+        held[at] = held[--held_n];
+      }
+
+      evs[i].code = item.keycode;
+      evs[i].value = item.value;
+    }
+
+    if (seq_result == OK && held_n != 0) {
+      /* The rule that lets this ship while OP_KEY_DOWN/UP wait for M4.5:
+         a request may not leave anything held. Nothing the daemon accepts
+         can strand a key if the client dies one microsecond later,
+         because by the time we answer, everything is already released. */
+      snprintf(args, sizeof(args),
+               "unbalanced: %d key(s) still held (first code=%u)", held_n,
+               held[0]);
+      seq_result = ERR_PAYLOAD_INVALID;
+    }
+
+    /* PASS 2 — policy, on a sequence already known to be well-formed.
+       Every item is checked before any is written: a per-item
+       check-then-write loop would leave a rejected modifier's press
+       already delivered, which is the stuck key arriving by the back
+       door. */
+    for (uint16_t i = 0; i < hdr.count && seq_result == OK; i++) {
+      const char *seq_why = NULL;
+      if (uinput_keycode_denied(evs[i].code, &seq_why)) {
+        snprintf(args, sizeof(args), "code=%u denied (%s)", evs[i].code,
+                 seq_why);
+        seq_result = ERR_KEY_DENYLISTED;
+      } else if (!key_allowed(evs[i].code)) {
+        snprintf(args, sizeof(args), "code=%u not in allowlist", evs[i].code);
+        seq_result = ERR_KEY_NOT_ALLOWED;
+      }
+    }
+
+    if (seq_result != OK) {
+      result = seq_result;
+      break;
+    }
+
+    int n = snprintf(args, sizeof(args), "seq n=%u:", hdr.count);
+    for (uint16_t i = 0; i < hdr.count && n > 0 && (size_t)n < sizeof(args);
+         i++)
+      n += snprintf(args + n, sizeof(args) - (size_t)n, " %u%s", evs[i].code,
+                    evs[i].value ? "v" : "^");
+    result = (uinput_key_seq(uinput_fd, evs, hdr.count) < 0) ? ERR_INTERNAL : OK;
     break;
   }
   default:
@@ -1252,11 +1777,20 @@ static void conn_dump_table(void) {
                             : "hdr";
     /* "-" for a peer that has not said HELLO. Safe to print unquoted:
        uictl_client_name_valid() is what let it be stored at all. */
+    /* Budget is per pid, so two connections from one process show the
+       same number — which is the point: they share it. */
+    unsigned tokens = 0;
+    for (int b = 0; b < RATE_BUCKETS; b++)
+      if (rate_buckets[b].used && rate_buckets[b].pid == c->cred.pid)
+        tokens = rate_buckets[b].milli / RATE_UNIT;
+
     fprintf(stderr,
             "  slot=%2d gen=%u fd=%d pid=%d uid=%u name=%s class=%s "
-            "phase=%s(%zu/%zu) reply=%zu/%zu age=%llds frames=%llu\n",
+            "tokens=%u/%u phase=%s(%zu/%zu) reply=%zu/%zu age=%llds "
+            "frames=%llu\n",
             i, c->generation, c->fd, (int)c->cred.pid, (unsigned)c->cred.uid,
-            c->hello_seen ? c->client_name : "-", class_name(c->cl), phase,
+            c->hello_seen ? c->client_name : "-", class_name(c->cl), tokens,
+            rate_classes[c->cl].burst, phase,
             c->have, c->want,
             c->out_sent, c->out_len, (long long)(now - c->accepted_at),
             (unsigned long long)c->frames_served);
@@ -1476,6 +2010,7 @@ int main(void) {
   /* Before the first accept, so no connection can be classified against
      a half-loaded registry. */
   load_client_registry();
+  load_key_policy();
 
   printf("uictld: listening on %s\n", path);
   fflush(stdout);

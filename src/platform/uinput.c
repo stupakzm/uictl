@@ -482,6 +482,40 @@ int uinput_keycode_denied(uint16_t code, const char **why_out) {
   return 0;
 }
 
+int uinput_key_seq(int fd, const struct uinput_key_event *evs, size_t n) {
+  if (!device_supports(fd, UINPUT_CAP_KEYBOARD, "key_seq"))
+    return -1;
+  if (n == 0 || n > UINPUT_SEQ_MAX_EVENTS) {
+    fprintf(stderr, "uinput: key_seq: %zu events, allowed 1..%d\n", n,
+            UINPUT_SEQ_MAX_EVENTS);
+    return -1;
+  }
+
+  /* +1 for the trailing SYN_REPORT: one frame, one report, however many
+     transitions it carries. That is M3 decision 5 doing the work it was
+     written for — the whole reason SYN is emitted per *request* and not
+     per event is so a modifier and its key land together. */
+  struct input_event frame[UINPUT_SEQ_MAX_EVENTS + 1] = {0};
+  for (size_t i = 0; i < n; i++) {
+    if (evs[i].code == KEY_RESERVED || evs[i].code > KEY_MAX) {
+      fprintf(stderr, "uinput: key_seq: keycode %u out of range 1..%u\n",
+              evs[i].code, KEY_MAX);
+      return -1;
+    }
+    if (evs[i].value > 1) {
+      fprintf(stderr, "uinput: key_seq: value %u is not 0 or 1\n",
+              evs[i].value);
+      return -1;
+    }
+    frame[i] = (struct input_event){
+        .type = EV_KEY, .code = evs[i].code, .value = evs[i].value};
+  }
+  frame[n] =
+      (struct input_event){.type = EV_SYN, .code = SYN_REPORT, .value = 0};
+
+  return write_event_frame(fd, frame, n + 1, "key_seq");
+}
+
 int uinput_key_tap(int fd, uint16_t code) {
   if (!device_supports(fd, UINPUT_CAP_KEYBOARD, "key_tap"))
     return -1;

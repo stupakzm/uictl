@@ -38,8 +38,125 @@ static const char *result_name(uint16_t r) {
     return "daemon busy, retry";
   case ERR_HANDSHAKE_REQUIRED:
     return "handshake required";
+  case ERR_KEY_DENYLISTED:
+    return "keycode is on the built-in deny-list";
+  case ERR_KEY_NOT_ALLOWED:
+    return "keycode is not in your policy file";
+  case ERR_RATE_LIMITED:
+    return "sending faster than your class allows";
   default:
     return "unknown result code";
+  }
+}
+
+/* What to DO about a result code.
+
+   A refusal that only says "denied" leaves the user to guess whether
+   they hit a wall or a config gap — and those call for opposite actions.
+   Every failure path here answers two questions: what happened, and what
+   would make it work. Where nothing would, it says so plainly instead of
+   sending someone to edit a file that cannot help.
+
+   `detail` carries the request-specific bit (a keycode, usually) so the
+   advice can be concrete enough to copy. */
+static void explain(uint16_t result, long detail) {
+  switch (result) {
+  case ERR_KEY_DENYLISTED:
+    fprintf(stderr,
+            "  why:  keycode %ld is on uictld's built-in destructive-key "
+            "deny-list\n"
+            "  fix:  none — this list is static and configuration cannot "
+            "unlock it.\n"
+            "        it covers power/suspend/restart, SysRq, radio kills, "
+            "brightness,\n"
+            "        eject, and the Fn/braille/numeric blocks.\n",
+            detail);
+    break;
+  case ERR_KEY_NOT_ALLOWED:
+    fprintf(stderr,
+            "  why:  keycode %ld is not listed in ~/.config/uictl/policy\n"
+            "  fix:  add a line `%ld` to that file (create it mode 0600), "
+            "then restart uictld.\n"
+            "        ranges work too: `183-194`. an absent or empty policy "
+            "file means\n"
+            "        NO keys at all — that is deliberate default-deny, not "
+            "a bug.\n",
+            detail, detail);
+    break;
+  case ERR_DENIED_BY_POLICY:
+    fprintf(stderr,
+            "  why:  the daemon refused this peer\n"
+            "  fix:  uictld only serves connections from its own uid. check "
+            "you are\n"
+            "        running as the same user that started it (`id`, "
+            "`pgrep -a uictld`).\n");
+    break;
+  case ERR_HANDSHAKE_REQUIRED:
+    fprintf(stderr,
+            "  why:  the daemon requires OP_HELLO before this opcode\n"
+            "  fix:  this is a client bug — every command except `ping` "
+            "must handshake\n"
+            "        first. report it.\n");
+    break;
+  case ERR_RATE_LIMITED:
+    fprintf(stderr,
+            "  why:  this process exceeded the request rate for its client "
+            "class\n"
+            "  fix:  pace the requests — retrying immediately makes it "
+            "worse, the bucket\n"
+            "        refills over time. limits are 5/s untrusted, 20/s "
+            "standard,\n"
+            "        50/s interactive. to get a higher class, add a line "
+            "like\n"
+            "        `myclient interactive` to ~/.config/uictl/clients "
+            "(mode 0600),\n"
+            "        restart uictld, and have the client send that name in "
+            "its HELLO.\n");
+    break;
+  case ERR_BUSY:
+    fprintf(stderr,
+            "  why:  no connection slot right now (32 total, 4 per "
+            "process)\n"
+            "  fix:  retry in a moment. if it persists, `kill -USR1 $(pgrep "
+            "-x uictld)`\n"
+            "        prints the connection table to the daemon's stderr — "
+            "look for a\n"
+            "        client holding slots it is not using.\n");
+    break;
+  case ERR_OPCODE_UNKNOWN:
+    fprintf(stderr,
+            "  why:  this daemon does not implement that request\n"
+            "  fix:  it is older than this client. rebuild and restart "
+            "uictld;\n"
+            "        `uictl hello NAME` lists what it does support.\n");
+    break;
+  case ERR_VERSION:
+    fprintf(stderr,
+            "  why:  no protocol version in common with the daemon\n"
+            "  fix:  rebuild both binaries from the same tree and restart "
+            "uictld.\n");
+    break;
+  case ERR_PAYLOAD_INVALID:
+    fprintf(stderr,
+            "  why:  the daemon rejected the request's contents\n"
+            "  fix:  for key-tap, keycodes run 1..%d. otherwise this is a "
+            "client bug.\n",
+            UINPUT_KEY_CODE_MAX);
+    break;
+  case ERR_TOO_LARGE:
+    fprintf(stderr, "  why:  the request exceeded the daemon's payload "
+                    "limit\n  fix:  send fewer items per request.\n");
+    break;
+  case ERR_INTERNAL:
+    fprintf(stderr,
+            "  why:  the daemon failed while performing the action\n"
+            "  fix:  check uictld's stderr — the device write failed, which "
+            "usually\n"
+            "        means /dev/uinput went away (module unloaded, device "
+            "destroyed).\n");
+    break;
+  default:
+    break;
   }
 }
 
@@ -48,12 +165,19 @@ static void usage(const char *prog) {
   fprintf(stderr, "       %s hello NAME\n", prog);
   fprintf(stderr, "       %s move-abs X Y\n", prog);
   fprintf(stderr, "       %s key-tap CODE\n", prog);
+  fprintf(stderr, "       %s key-combo CODE [CODE...]   (e.g. 29 30 = "
+                  "Ctrl+A)\n", prog);
 }
 
 static int open_socket(void) {
   const char *xdg = getenv("XDG_RUNTIME_DIR");
   if (!xdg) {
-    fprintf(stderr, "uictl: XDG_RUNTIME_DIR is not set\n");
+    fprintf(stderr, "uictl: XDG_RUNTIME_DIR is not set\n"
+                    "  why:  the socket lives in the per-user runtime "
+                    "directory\n"
+                    "  fix:  run inside a normal login session, or set it "
+                    "to the same\n"
+                    "        directory uictld used.\n");
     return -1;
   }
 
@@ -74,7 +198,14 @@ static int open_socket(void) {
   strcpy(addr.sun_path, path);
 
   if (connect(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("uictl: connect");
+    fprintf(stderr, "uictl: cannot reach the daemon at %s: %s\n", path,
+            strerror(errno));
+    if (errno == ENOENT || errno == ECONNREFUSED)
+      fprintf(stderr, "  fix:  uictld is not running. start it "
+                      "(`./uictld`) and try again.\n");
+    else if (errno == EACCES)
+      fprintf(stderr, "  fix:  the socket belongs to another user. uictld "
+                      "serves only its own uid.\n");
     close(sfd);
     return -1;
   }
@@ -211,8 +342,8 @@ static int cmd_ping(int sfd) {
   }
 
   if (result != OK) {
-    fprintf(stderr, "uictl: ping failed: %s (result=%u)\n",
-            result_name(result), result);
+    fprintf(stderr, "uictl: ping failed: %s\n", result_name(result));
+    explain(result, 0);
     return 1;
   }
 
@@ -246,7 +377,13 @@ static int client_hello(int sfd, const char *name, int verbose,
      zero — the daemon rejects junk hiding there. */
   memcpy(hello.client_name, name, len);
   if (!uictl_client_name_valid(hello.client_name)) {
-    fprintf(stderr, "uictl: client name must be [A-Za-z0-9._-]\n");
+    fprintf(stderr,
+            "uictl: client name '%s' is not usable\n"
+            "  why:  names go into the audit log, so only [A-Za-z0-9._-] "
+            "are accepted\n"
+            "        (a newline would let a client forge log lines)\n"
+            "  fix:  use a plain name, e.g. `muvor` or `auto-c`.\n",
+            name);
     return 1;
   }
 
@@ -279,8 +416,8 @@ static int client_hello(int sfd, const char *name, int verbose,
                     &data_len) < 0)
     return 1;
   if (result != OK) {
-    fprintf(stderr, "uictl: hello failed: %s (result=%u)\n",
-            result_name(result), result);
+    fprintf(stderr, "uictl: hello failed: %s\n", result_name(result));
+    explain(result, 0);
     return 1;
   }
   /* >=, never ==. Short is a broken daemon; long is a newer one, and
@@ -310,11 +447,13 @@ static int client_hello(int sfd, const char *name, int verbose,
          (caps.device_caps & CAP_KEYBOARD) ? "keyboard " : "",
          (caps.device_caps & CAP_POINTER_REL) ? "pointer-rel " : "",
          (caps.device_caps & CAP_BUTTONS) ? "buttons" : "");
-  printf("  opcodes    %s%s%s%s\n",
+  printf("  opcodes    %s%s%s%s%s\n",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_PING)) ? "ping " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_MOVE_ABS)) ? "move-abs " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_HELLO)) ? "hello " : "",
-         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP)) ? "key-tap" : "");
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP)) ? "key-tap " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_SEQUENCE)) ? "key-seq"
+                                                              : "");
   return 0;
 }
 
@@ -329,7 +468,13 @@ static int client_hello(int sfd, const char *name, int verbose,
    "result=2". */
 static int cmd_key_tap(int sfd, int32_t code) {
   if (code < 1 || code > UINPUT_KEY_CODE_MAX) {
-    fprintf(stderr, "uictl: keycode must be 1..%d\n", UINPUT_KEY_CODE_MAX);
+    fprintf(stderr,
+            "uictl: keycode %d is out of range\n"
+            "  why:  the kernel's keycodes run 1..%d (0 is KEY_RESERVED)\n"
+            "  fix:  see /usr/include/linux/input-event-codes.h — e.g. 30 "
+            "is KEY_A,\n"
+            "        183 is KEY_F13.\n",
+            code, UINPUT_KEY_CODE_MAX);
     return 1;
   }
 
@@ -339,9 +484,9 @@ static int cmd_key_tap(int sfd, int32_t code) {
 
   if (!(caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP))) {
     fprintf(stderr,
-            "uictl: this daemon does not advertise key-tap "
-            "(opcode_bitmap=0x%llx). key injection is wired in M4 step 7, "
-            "after the deny-list.\n",
+            "uictl: this daemon does not offer key-tap\n"
+            "  why:  it did not advertise the opcode (bitmap=0x%llx)\n"
+            "  fix:  it is an older build. rebuild and restart uictld.\n",
             (unsigned long long)caps.opcode_bitmap);
     return 1;
   }
@@ -369,11 +514,111 @@ static int cmd_key_tap(int sfd, int32_t code) {
   if (read_response(sfd, OP_KEY_TAP, req.seq, &result, NULL, 0, NULL) < 0)
     return 1;
   if (result != OK) {
-    fprintf(stderr, "uictl: key-tap failed: %s (result=%u)\n",
-            result_name(result), result);
+    fprintf(stderr, "uictl: key-tap %d failed: %s\n", code,
+            result_name(result));
+    explain(result, code);
     return 1;
   }
   printf("OK seq=%u code=%d\n", req.seq, code);
+  return 0;
+}
+
+/* `uictl key-combo MOD... KEY` — press every code in order, then release
+   them in reverse. Ctrl+A is `key-combo 29 30`.
+
+   The CLI only offers this shape, not arbitrary sequences, because it is
+   the shape that is always balanced by construction: the user cannot ask
+   for something the daemon will reject as unbalanced. The wire is more
+   general (any list of press/release items) for clients that need it. */
+static int cmd_key_combo(int sfd, const int32_t *codes, int n) {
+  if (n < 1 || n * 2 > UICTL_SEQ_MAX) {
+    fprintf(stderr,
+            "uictl: %d key(s) is out of range\n"
+            "  why:  a combo becomes 2 events per key and a sequence "
+            "carries at most %d\n"
+            "  fix:  use at most %d keys per combo.\n",
+            n, UICTL_SEQ_MAX, UICTL_SEQ_MAX / 2);
+    return 1;
+  }
+  for (int i = 0; i < n; i++) {
+    if (codes[i] < 1 || codes[i] > UINPUT_KEY_CODE_MAX) {
+      fprintf(stderr,
+              "uictl: keycode %d is out of range\n"
+              "  why:  the kernel's keycodes run 1..%d (0 is "
+              "KEY_RESERVED)\n"
+              "  fix:  see /usr/include/linux/input-event-codes.h — 29 is "
+              "KEY_LEFTCTRL,\n        30 is KEY_A.\n",
+              codes[i], UINPUT_KEY_CODE_MAX);
+      return 1;
+    }
+    for (int j = 0; j < i; j++)
+      if (codes[j] == codes[i]) {
+        fprintf(stderr,
+                "uictl: keycode %d appears twice\n"
+                "  why:  a combo presses each key once; pressing a held "
+                "key is refused\n"
+                "  fix:  list each keycode at most once.\n",
+                codes[i]);
+        return 1;
+      }
+  }
+
+  struct uictl_resp_hello caps;
+  if (client_hello(sfd, "uictl", 0, &caps) != 0)
+    return 1;
+  if (!(caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_SEQUENCE))) {
+    fprintf(stderr,
+            "uictl: this daemon does not offer key sequences\n"
+            "  why:  it did not advertise the opcode (bitmap=0x%llx)\n"
+            "  fix:  it is an older build. rebuild and restart uictld.\n",
+            (unsigned long long)caps.opcode_bitmap);
+    return 1;
+  }
+
+  uint16_t count = (uint16_t)(n * 2);
+  char payload[sizeof(struct uictl_payload_key_seq) +
+               UICTL_SEQ_MAX * sizeof(struct uictl_seq_item)];
+  memset(payload, 0, sizeof(payload));
+  struct uictl_payload_key_seq shdr = {.count = count, .reserved = 0};
+  memcpy(payload, &shdr, sizeof(shdr));
+
+  size_t off = sizeof(shdr);
+  for (int i = 0; i < n; i++) { /* press in order */
+    struct uictl_seq_item it = {.keycode = (uint16_t)codes[i], .value = 1};
+    memcpy(payload + off, &it, sizeof(it));
+    off += sizeof(it);
+  }
+  for (int i = n - 1; i >= 0; i--) { /* release in reverse */
+    struct uictl_seq_item it = {.keycode = (uint16_t)codes[i], .value = 0};
+    memcpy(payload + off, &it, sizeof(it));
+    off += sizeof(it);
+  }
+
+  struct uictl_frame_header req = {.version = UICTL_PROTO_VERSION,
+                                   .opcode = OP_KEY_SEQUENCE,
+                                   .source_tag = SRC_CLI,
+                                   .seq = 2,
+                                   .payload_len = (uint32_t)off};
+  char req_hdr_buf[sizeof(struct uictl_frame_header)];
+  encode_frame_header(&req, req_hdr_buf);
+  if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0 ||
+      write_full(sfd, payload, off) < 0) {
+    fprintf(stderr, "uictl: write request\n");
+    return 1;
+  }
+
+  uint16_t result;
+  if (read_response(sfd, OP_KEY_SEQUENCE, req.seq, &result, NULL, 0, NULL) < 0)
+    return 1;
+  if (result != OK) {
+    fprintf(stderr, "uictl: key-combo failed: %s\n", result_name(result));
+    /* The keycode in the message is the first one; the daemon rejects on
+       the first offending item, and for a 2-key combo that is nearly
+       always the modifier or the key itself. */
+    explain(result, codes[0]);
+    return 1;
+  }
+  printf("OK seq=%u (%d keys)\n", req.seq, n);
   return 0;
 }
 
@@ -413,8 +658,8 @@ static int cmd_move_abs(int sfd, int32_t x, int32_t y) {
   }
 
   if (result != OK) {
-    fprintf(stderr, "uictl: move-abs failed: %s (result=%u)\n",
-            result_name(result), result);
+    fprintf(stderr, "uictl: move-abs failed: %s\n", result_name(result));
+    explain(result, 0);
     return 1;
   }
 
@@ -468,6 +713,31 @@ int main(int argc, char *argv[]) {
     if (sfd < 0)
       return 1;
     int rc = cmd_key_tap(sfd, code);
+    close(sfd);
+    return rc;
+  }
+
+  if (strcmp(argv[1], "key-combo") == 0) {
+    if (argc < 3) {
+      usage(argv[0]);
+      return 1;
+    }
+    int32_t codes[UICTL_SEQ_MAX];
+    int n = argc - 2;
+    if (n > (int)(sizeof(codes) / sizeof(codes[0]))) {
+      fprintf(stderr, "uictl: too many keys\n");
+      return 1;
+    }
+    for (int i = 0; i < n; i++) {
+      if (!parse_int32(argv[2 + i], &codes[i])) {
+        fprintf(stderr, "uictl: '%s' is not a keycode\n", argv[2 + i]);
+        return 1;
+      }
+    }
+    int sfd = open_socket();
+    if (sfd < 0)
+      return 1;
+    int rc = cmd_key_combo(sfd, codes, n);
     close(sfd);
     return rc;
   }

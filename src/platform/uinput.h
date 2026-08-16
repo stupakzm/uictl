@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h> /* size_t */
 #include <stdint.h>
 
 #define ABS_RANGE_MAX INT16_MAX
@@ -48,6 +49,23 @@ int uinput_move_abs(int fd, int32_t x, int32_t y);
    anyway. Which keys a *client* may ask for is decided one layer up and
    is a different question with a different answer. */
 int uinput_key_tap(int fd, uint16_t code);
+
+/* Apply several key transitions in ONE event frame — one write, one
+   SYN_REPORT, so the compositor sees them as a single atomic report.
+   `n` must be 1..UINPUT_SEQ_MAX_EVENTS.
+
+   The daemon guarantees the sequence is balanced before calling; this
+   layer only range-checks and writes. Keeping the balance rule out of
+   here is deliberate: it is a policy about what a *request* may contain,
+   and the platform layer's job is what the *device* can accept. */
+#define UINPUT_SEQ_MAX_EVENTS 16
+
+struct uinput_key_event {
+  uint16_t code;
+  uint8_t value; /* 1 = press, 0 = release */
+};
+
+int uinput_key_seq(int fd, const struct uinput_key_event *evs, size_t n);
 
 /* Is this keycode on the destructive-action deny-list? (M4 step 6.)
    Non-zero means refuse; `*why_out`, if given, receives a short static
