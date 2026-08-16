@@ -30,6 +30,13 @@ static const char *opname(uint16_t op) {
     return "MOVE_ABS";
   case OP_HELLO:
     return "HELLO";
+  case OP_KEY_TAP:
+    /* Named before it is implemented, on purpose. Until step 5 a
+       KEY_TAP frame is refused with ERR_OPCODE_UNKNOWN — and the audit
+       line should say *which* opcode was refused. "someone asked for
+       KEY_TAP and was turned away" is exactly the kind of intent the
+       audit log exists to record; "UNKNOWN" would throw it away. */
+    return "KEY_TAP";
   default:
     return "UNKNOWN";
   }
@@ -724,17 +731,46 @@ static void conn_writable(int epfd, struct conn *c) {
    The two bitmaps are the contract. `daemon_version` is deliberately
    *not* — a client that branches on it is feature-sniffing, and the
    whole point of shipping a capability map is that it never has to. */
+/* What the device actually came up with, from uinput_open(). File scope
+   because conn_handle_frame answers HELLO and has no route to main's
+   locals; written exactly once, before the first accept. */
+static uint16_t g_device_caps;
+
+/* The one place platform capabilities become wire capabilities.
+   The assert is the guard rail: add a UINPUT_CAP_* flag without adding
+   its wire bit here and the BUILD fails, instead of the daemon quietly
+   advertising less than it can do. Drift between what the device is and
+   what clients are told is exactly the kind of bug that surfaces as
+   "muvor thinks there's no keyboard" three milestones later. */
+static uint16_t wire_caps_from_uinput(uint32_t hal_caps) {
+  _Static_assert(UINPUT_CAP__ALL ==
+                     (UINPUT_CAP_POINTER_ABS | UINPUT_CAP_KEYBOARD),
+                 "a platform capability was added — map it to a wire CAP_* "
+                 "bit here and extend this assert");
+  uint16_t caps = 0;
+  if (hal_caps & UINPUT_CAP_POINTER_ABS)
+    caps |= CAP_POINTER_ABS;
+  if (hal_caps & UINPUT_CAP_KEYBOARD)
+    caps |= CAP_KEYBOARD;
+  return caps;
+}
+
 static struct uictl_resp_hello daemon_capabilities(uint16_t proto_selected) {
   struct uictl_resp_hello r = {
       .proto_selected = proto_selected,
-      /* Only the absolute pointer exists today. Keyboard is M4, buttons
-         and relative motion are M5.5 — a client asking "do you have
-         buttons yet?" gets a truthful no, which is exactly the question
-         G3 says muvor needs to be able to ask. */
-      .device_caps = CAP_POINTER_ABS,
+      /* Reported, not asserted: whatever the device really has. Since
+         M4 step 1 that includes CAP_KEYBOARD — the device can emit every
+         keycode — while `opcode_bitmap` below still has no key opcode,
+         because nothing can *ask* for one yet. That gap is the whole
+         reason the two fields are separate: capability is not
+         permission, and a client must gate on the opcode bit. */
+      .device_caps = g_device_caps,
       .abs_range_max = (uint32_t)ABS_RANGE_MAX,
+      /* OP_KEY_TAP joins the map in M4 step 7 and not before: the bitmap
+         is the contract, and it may only advertise what is fully wired —
+         validated, gated by the deny-list, and actually injected. */
       .opcode_bitmap = UICTL_OP_BIT(OP_PING) | UICTL_OP_BIT(OP_MOVE_ABS) |
-                       UICTL_OP_BIT(OP_HELLO),
+                       UICTL_OP_BIT(OP_HELLO) | UICTL_OP_BIT(OP_KEY_TAP),
       .daemon_version = UICTL_DAEMON_VERSION,
       .reserved = 0,
   };
@@ -927,6 +963,66 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
              c->client_name, c->proto_selected, c->proto_min, c->proto_max,
              class_name(c->cl));
     result = OK;
+    break;
+  }
+  case OP_KEY_TAP: {
+    /* The full path, in the order the milestone built it: size check
+       (step 5), range check (step 5), deny-list (step 6), inject
+       (step 7). Nothing was ever reachable before the check above it
+       existed — that ordering is why no build in this milestone's
+       history could turn a socket into an arbitrary keystroke.
+
+       Exact size, not >=: a command frame is only sent after the version
+       is negotiated and pinned, so there is no version skew to absorb
+       and a wrong length means a broken client. */
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_key)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_key key;
+    decode_key(c->buf, &key);
+
+    /* Range, not policy. The device registered 1..KEY_MAX and the kernel
+       would reject anything else; *which* of those keys a client may ask
+       for is step 6's deny-list, a separate question with a separate
+       answer and a different result code (ERR_DENIED_BY_POLICY). Keeping
+       them apart is what stops "invalid" and "forbidden" from blurring
+       into one unreadable audit trail. */
+    if (key.keycode == 0 || key.keycode > UINPUT_KEY_CODE_MAX) {
+      snprintf(args, sizeof(args), "code=%u out of range", key.keycode);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+
+    /* Policy, checked while the handler is still a stub (M4 step 6).
+       This is the ordering the whole milestone is built around: the
+       deny-list exists before any build can turn a socket into a
+       keystroke, so there is no window — not even one commit wide — in
+       which arbitrary keys are reachable.
+
+       ERR_DENIED_BY_POLICY, not ERR_PAYLOAD_INVALID: the request was
+       well-formed and the answer is "you may not". A client can tell
+       "fix your encoder" from "that key is off limits", and the audit
+       log records which of the two happened. */
+    const char *why = NULL;
+    if (uinput_keycode_denied(key.keycode, &why)) {
+      snprintf(args, sizeof(args), "code=%u denied (%s)", key.keycode, why);
+      result = ERR_DENIED_BY_POLICY;
+      break;
+    }
+
+    /* M4 step 7: the injection, and note where it sits — *after* the
+       size check, the range check and the deny-list, and nowhere else.
+       There is exactly one call site, so "which keys can reach the
+       device" is answerable by reading the lines above it.
+
+       Audit BEFORE the write is not what happens here (the shared
+       audit_log call is below, after the switch) and that is deliberate:
+       the record then carries the real result, including ERR_INTERNAL if
+       the device write failed. An audit line saying a key was injected
+       when the write failed would be worse than a late one. */
+    snprintf(args, sizeof(args), "code=%u", key.keycode);
+    result = (uinput_key_tap(uinput_fd, key.keycode) < 0) ? ERR_INTERNAL : OK;
     break;
   }
   default:
@@ -1284,7 +1380,8 @@ int main(void) {
     return 1;
   }
 
-  int uinput_fd = uinput_open();
+  uint32_t hal_caps = 0;
+  int uinput_fd = uinput_open(&hal_caps);
   if (uinput_fd < 0) {
     close(audit_fd);
     close(lockfd);
@@ -1292,6 +1389,24 @@ int main(void) {
     unlink(path);
     return 1;
   }
+
+  g_device_caps = wire_caps_from_uinput(hal_caps);
+  /* A device with no advertised ability is a bug in uinput_open(), not a
+     degraded mode to run in: every RPC that reaches the device would
+     fail one at a time, at request time, on somebody else's machine.
+     Refuse to start instead. */
+  if (g_device_caps == 0) {
+    fprintf(stderr, "uictld: device came up with no capabilities\n");
+    uinput_close(uinput_fd);
+    close(audit_fd);
+    close(lockfd);
+    close(sfd);
+    unlink(path);
+    return 1;
+  }
+  fprintf(stderr, "uictld: device caps 0x%x (%s%s)\n", g_device_caps,
+          (g_device_caps & CAP_POINTER_ABS) ? "pointer-abs " : "",
+          (g_device_caps & CAP_KEYBOARD) ? "keyboard" : "");
 
   int sigfd = signalfd(-1, &mask, SFD_CLOEXEC);
   if (sigfd < 0) {

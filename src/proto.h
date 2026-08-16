@@ -27,7 +27,19 @@
 #define UICTL_PROTO_VERSION UICTL_PROTO_MAX
 #define UICTL_MAX_PAYLOAD 4096
 
-enum uictl_op { OP_INVALID = 0, OP_PING, OP_MOVE_ABS, OP_HELLO };
+/* Opcodes are on the wire: append only, never renumber. A client built
+   against an older header must keep meaning the same thing by the same
+   number.
+
+   OP_KEY_TAP exists here from M4 step 3 but is NOT advertised in
+   `opcode_bitmap` and NOT answered by the daemon until step 7, when real
+   injection is connected behind the deny-list. Defining the shape early
+   is deliberate — the payload layout and the client encoder can be
+   settled while the handler is still a stub — but the bitmap is the
+   contract, and it must not claim a key can be pressed before one can.
+   See plan.md §"v0.2 Milestone 4" for why policy lands before the
+   injection path rather than after. */
+enum uictl_op { OP_INVALID = 0, OP_PING, OP_MOVE_ABS, OP_HELLO, OP_KEY_TAP };
 
 /* Result codes are ON THE WIRE. Append only — never insert, never
    reorder. A client built against an older header must keep decoding
@@ -155,6 +167,29 @@ struct uictl_payload_hello {
 _Static_assert(sizeof(struct uictl_payload_hello) == 36,
                "HELLO payload must be exactly 36 bytes");
 
+/* KEY_TAP payload (M4 step 3): one keycode, pressed and released.
+
+   Numeric keycodes only for now — a symbolic `KEY_A` name table belongs
+   in the client and is a later nicety. Keeping the first keyboard RPC
+   numeric is honest about what the wire actually carries.
+
+   `uint16_t` because that is what `input_event.code` is; a wider field
+   would invite values the kernel cannot represent, and a narrower one
+   could not reach KEY_MAX (767). The daemon still range-checks it: the
+   type bounds what is *expressible*, not what is *acceptable*.
+
+   Exactly 2 bytes, no padding, so `payload_len == 2` is the only legal
+   size for this opcode. Deliberately NOT append-only like HELLO's:
+   HELLO is the bootstrap frame and must survive version skew, while a
+   command frame is only ever sent after the version is negotiated and
+   pinned, so an exact size is the stricter and better check. */
+struct uictl_payload_key {
+  uint16_t keycode;
+};
+
+_Static_assert(sizeof(struct uictl_payload_key) == 2,
+               "KEY_TAP payload must be exactly 2 bytes");
+
 /* What the daemon can do, answered in the HELLO response (M3.6 task 3).
    Capability bits describe the *device*, opcode bits describe the
    *protocol*; they are separate because M4 registers every keycode on
@@ -221,6 +256,12 @@ static inline void encode_move_abs(const struct uictl_payload_move_abs *p,
 }
 static inline void decode_move_abs(const void *buf,
                                    struct uictl_payload_move_abs *p) {
+  memcpy(p, buf, sizeof(*p));
+}
+static inline void encode_key(const struct uictl_payload_key *p, void *buf) {
+  memcpy(buf, p, sizeof(*p));
+}
+static inline void decode_key(const void *buf, struct uictl_payload_key *p) {
   memcpy(p, buf, sizeof(*p));
 }
 static inline void encode_hello(const struct uictl_payload_hello *p,

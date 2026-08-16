@@ -1,4 +1,5 @@
 #include "proto.h"
+#include "platform/uinput.h" /* UINPUT_KEY_CODE_MAX */
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -13,10 +14,40 @@
 #include <fcntl.h>
 #include <time.h>
 
+/* Result codes are numbers on the wire; a person reading a terminal
+   wants the name. Kept in the client, not proto.h: the daemon must never
+   grow a reason to render a result code, and a table it does not have is
+   a table it cannot start logging instead of the audit line. */
+static const char *result_name(uint16_t r) {
+  switch (r) {
+  case OK:
+    return "OK";
+  case ERR_VERSION:
+    return "protocol version mismatch";
+  case ERR_OPCODE_UNKNOWN:
+    return "opcode not implemented";
+  case ERR_PAYLOAD_INVALID:
+    return "malformed request";
+  case ERR_DENIED_BY_POLICY:
+    return "denied by policy";
+  case ERR_TOO_LARGE:
+    return "payload too large";
+  case ERR_INTERNAL:
+    return "daemon internal error";
+  case ERR_BUSY:
+    return "daemon busy, retry";
+  case ERR_HANDSHAKE_REQUIRED:
+    return "handshake required";
+  default:
+    return "unknown result code";
+  }
+}
+
 static void usage(const char *prog) {
   fprintf(stderr, "usage: %s ping\n", prog);
   fprintf(stderr, "       %s hello NAME\n", prog);
   fprintf(stderr, "       %s move-abs X Y\n", prog);
+  fprintf(stderr, "       %s key-tap CODE\n", prog);
 }
 
 static int open_socket(void) {
@@ -180,7 +211,8 @@ static int cmd_ping(int sfd) {
   }
 
   if (result != OK) {
-    fprintf(stderr, "uictl: ping failed, result=%u\n", result);
+    fprintf(stderr, "uictl: ping failed: %s (result=%u)\n",
+            result_name(result), result);
     return 1;
   }
 
@@ -199,7 +231,8 @@ static int cmd_ping(int sfd) {
    it would live inside the connect path of a library (M-lib); here the
    CLI's one-shot connections each pay one extra round trip, which is
    the honest cost of the daemon knowing who it is talking to. */
-static int client_hello(int sfd, const char *name, int verbose) {
+static int client_hello(int sfd, const char *name, int verbose,
+                        struct uictl_resp_hello *caps_out) {
   struct uictl_payload_hello hello = {.proto_min = UICTL_PROTO_MIN,
                                       .proto_max = UICTL_PROTO_MAX};
 
@@ -246,7 +279,8 @@ static int client_hello(int sfd, const char *name, int verbose) {
                     &data_len) < 0)
     return 1;
   if (result != OK) {
-    fprintf(stderr, "uictl: hello failed, result=%u\n", result);
+    fprintf(stderr, "uictl: hello failed: %s (result=%u)\n",
+            result_name(result), result);
     return 1;
   }
   /* >=, never ==. Short is a broken daemon; long is a newer one, and
@@ -259,6 +293,8 @@ static int client_hello(int sfd, const char *name, int verbose) {
 
   struct uictl_resp_hello caps;
   decode_resp_hello(data, &caps);
+  if (caps_out)
+    *caps_out = caps;
 
   if (!verbose)
     return 0;
@@ -274,10 +310,70 @@ static int client_hello(int sfd, const char *name, int verbose) {
          (caps.device_caps & CAP_KEYBOARD) ? "keyboard " : "",
          (caps.device_caps & CAP_POINTER_REL) ? "pointer-rel " : "",
          (caps.device_caps & CAP_BUTTONS) ? "buttons" : "");
-  printf("  opcodes    %s%s%s\n",
+  printf("  opcodes    %s%s%s%s\n",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_PING)) ? "ping " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_MOVE_ABS)) ? "move-abs " : "",
-         (caps.opcode_bitmap & UICTL_OP_BIT(OP_HELLO)) ? "hello" : "");
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_HELLO)) ? "hello " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP)) ? "key-tap" : "");
+  return 0;
+}
+
+/* `uictl key-tap <code>` (M4 step 4).
+
+   Gates on `opcode_bitmap` rather than trying and hoping. That is the
+   pattern every client is supposed to follow — the bitmap is the
+   contract, `device_caps` only says the hardware side is ready — and
+   this is the first place the CLI actually uses it. Until step 7
+   advertises OP_KEY_TAP the command refuses locally and says exactly
+   what is missing, which beats sending a frame and printing an opaque
+   "result=2". */
+static int cmd_key_tap(int sfd, int32_t code) {
+  if (code < 1 || code > UINPUT_KEY_CODE_MAX) {
+    fprintf(stderr, "uictl: keycode must be 1..%d\n", UINPUT_KEY_CODE_MAX);
+    return 1;
+  }
+
+  struct uictl_resp_hello caps;
+  if (client_hello(sfd, "uictl", 0, &caps) != 0)
+    return 1;
+
+  if (!(caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP))) {
+    fprintf(stderr,
+            "uictl: this daemon does not advertise key-tap "
+            "(opcode_bitmap=0x%llx). key injection is wired in M4 step 7, "
+            "after the deny-list.\n",
+            (unsigned long long)caps.opcode_bitmap);
+    return 1;
+  }
+
+  struct uictl_payload_key key = {.keycode = (uint16_t)code};
+  struct uictl_frame_header req = {.version = UICTL_PROTO_VERSION,
+                                   .opcode = OP_KEY_TAP,
+                                   .source_tag = SRC_CLI,
+                                   .seq = 2, /* 1 was the handshake */
+                                   .payload_len = sizeof(key)};
+  char req_hdr_buf[sizeof(struct uictl_frame_header)];
+  encode_frame_header(&req, req_hdr_buf);
+  if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0) {
+    fprintf(stderr, "uictl: write header\n");
+    return 1;
+  }
+  char payload_buf[sizeof(key)];
+  encode_key(&key, payload_buf);
+  if (write_full(sfd, payload_buf, sizeof(payload_buf)) < 0) {
+    fprintf(stderr, "uictl: write payload\n");
+    return 1;
+  }
+
+  uint16_t result;
+  if (read_response(sfd, OP_KEY_TAP, req.seq, &result, NULL, 0, NULL) < 0)
+    return 1;
+  if (result != OK) {
+    fprintf(stderr, "uictl: key-tap failed: %s (result=%u)\n",
+            result_name(result), result);
+    return 1;
+  }
+  printf("OK seq=%u code=%d\n", req.seq, code);
   return 0;
 }
 
@@ -285,7 +381,7 @@ static int cmd_move_abs(int sfd, int32_t x, int32_t y) {
   /* Not optional since task 7: MOVE_ABS before HELLO is refused with
      ERR_HANDSHAKE_REQUIRED. The name is what the daemon looks up in its
      client registry to decide this connection's class. */
-  if (client_hello(sfd, "uictl", 0) != 0)
+  if (client_hello(sfd, "uictl", 0, NULL) != 0)
     return 1;
 
   struct uictl_payload_move_abs mv = {.x = x, .y = y};
@@ -317,7 +413,8 @@ static int cmd_move_abs(int sfd, int32_t x, int32_t y) {
   }
 
   if (result != OK) {
-    fprintf(stderr, "uictl: move-abs failed, result=%u\n", result);
+    fprintf(stderr, "uictl: move-abs failed: %s (result=%u)\n",
+            result_name(result), result);
     return 1;
   }
 
@@ -352,7 +449,25 @@ int main(int argc, char *argv[]) {
     int sfd = open_socket();
     if (sfd < 0)
       return 1;
-    int rc = client_hello(sfd, argv[2], 1);
+    int rc = client_hello(sfd, argv[2], 1, NULL);
+    close(sfd);
+    return rc;
+  }
+
+  if (strcmp(argv[1], "key-tap") == 0) {
+    if (argc != 3) {
+      usage(argv[0]);
+      return 1;
+    }
+    int32_t code;
+    if (!parse_int32(argv[2], &code)) {
+      fprintf(stderr, "uictl: bad keycode\n");
+      return 1;
+    }
+    int sfd = open_socket();
+    if (sfd < 0)
+      return 1;
+    int rc = cmd_key_tap(sfd, code);
     close(sfd);
     return rc;
   }
