@@ -28,6 +28,8 @@ static const char *opname(uint16_t op) {
     return "PING";
   case OP_MOVE_ABS:
     return "MOVE_ABS";
+  case OP_HELLO:
+    return "HELLO";
   default:
     return "UNKNOWN";
   }
@@ -93,6 +95,197 @@ static int open_audit_log(const char *state_dir) {
     return -1;
   }
   return fd;
+}
+
+/* ---- client identity (M3.6 task 5) ----------------------------------
+   Two halves, and keeping them straight is the whole point:
+
+     pid   — from SO_PEERCRED, filled in by the kernel, unforgeable.
+             Already the basis of the per-pid connection cap, and it is
+             what a future rate-limit bucket must key on.
+     name  — from HELLO, self-asserted, a label. It selects a *class*
+             from a local registry the user writes.
+
+   A name is not a credential and never becomes one. What makes the
+   scheme worth having is the direction of the default: an unregistered
+   name gets the most restrictive class, so asserting a name can only
+   ever *raise* privilege by an explicit decision the user already wrote
+   down, and asserting nothing (or lying) leaves you at the floor. That
+   is strictly better than `source_tag`, where a client picks its own
+   tier per frame (G2).
+
+   What this does NOT defend against: every peer is the same uid
+   (invariant 9), so a hostile local process can claim "muvor" and get
+   muvor's class — it could equally just run the real muvor binary. If
+   classes ever need to differ in *trust* rather than in blast radius,
+   the answer is option C from the M3.6 notes (per-class socket paths,
+   authenticated by filesystem permissions), not a stricter name check. */
+enum client_class {
+  /* 0 is the floor on purpose: a zeroed struct conn is untrusted, so
+     forgetting to assign a class fails closed rather than open. */
+  CLASS_UNTRUSTED = 0,
+  CLASS_STANDARD,
+  CLASS_INTERACTIVE,
+  CLASS__COUNT
+};
+
+static const char *class_name(enum client_class cl) {
+  switch (cl) {
+  case CLASS_STANDARD:
+    return "standard";
+  case CLASS_INTERACTIVE:
+    return "interactive";
+  case CLASS_UNTRUSTED:
+  default:
+    return "untrusted";
+  }
+}
+
+static int class_from_word(const char *word, enum client_class *out) {
+  for (enum client_class cl = 0; cl < CLASS__COUNT; cl++) {
+    if (strcmp(word, class_name(cl)) == 0) {
+      *out = cl;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+#define MAX_REGISTERED_CLIENTS 16
+#define REGISTRY_MAX_BYTES 4096
+
+struct client_reg {
+  char name[UICTL_CLIENT_NAME_MAX];
+  enum client_class cl;
+};
+
+static struct client_reg registry[MAX_REGISTERED_CLIENTS];
+static int registry_len;
+
+/* Read ~/.config/uictl/clients once at startup: one `name class` pair
+   per line, `#` comments, blanks ignored.
+
+   Startup and not per-HELLO, deliberately. Re-reading per request would
+   put file I/O in the request path and make a client's class depend on
+   whatever the file said at that instant — a config edit would take
+   effect halfway through a session, for some connections and not
+   others. Loaded once, the daemon's policy is whatever it started with,
+   which is also what the audit log then means. A reload belongs on
+   SIGHUP if it is ever wanted.
+
+   Same ownership posture as the audit log (security rule 4): the file
+   decides who gets elevated, so another user being able to write it
+   would be the whole game. */
+static void load_client_registry(void) {
+  const char *home = getenv("HOME");
+  if (!home)
+    return;
+
+  char path[256];
+  int n = snprintf(path, sizeof(path), "%s/.config/uictl/clients", home);
+  if (n < 0 || (size_t)n >= sizeof(path))
+    return;
+
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno != ENOENT)
+      perror("uictld: open client registry");
+    fprintf(stderr,
+            "uictld: no client registry at %s — every client is '%s'\n", path,
+            class_name(CLASS_UNTRUSTED));
+    return;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+      (st.st_mode & 0077)) {
+    fprintf(stderr, "uictld: %s must be a regular file owned by this uid "
+                    "with no group/world bits — ignoring it\n",
+            path);
+    close(fd);
+    return;
+  }
+
+  char buf[REGISTRY_MAX_BYTES + 1];
+  ssize_t got = read_full(fd, buf, REGISTRY_MAX_BYTES);
+  close(fd);
+  if (got < 0) {
+    perror("uictld: read client registry");
+    return;
+  }
+  buf[got] = '\0';
+
+  /* Split lines by hand rather than with strtok_r: strtok collapses
+     runs of delimiters, so two consecutive newlines are one separator
+     and every blank line silently shifts the reported line number. A
+     config error that points at the wrong line is worse than no line
+     number at all. */
+  int line_no = 0;
+  for (char *p = buf; *p;) {
+    char *line = p;
+    char *eol = strchr(p, '\n');
+    if (eol) {
+      *eol = '\0';
+      p = eol + 1;
+    } else {
+      p += strlen(p);
+    }
+    line_no++;
+
+    char *hash = strchr(line, '#');
+    if (hash)
+      *hash = '\0';
+
+    char *fsave = NULL;
+    const char *name = strtok_r(line, " \t\r", &fsave);
+    if (!name)
+      continue; /* blank or comment-only */
+    const char *word = strtok_r(NULL, " \t\r", &fsave);
+
+    if (registry_len == MAX_REGISTERED_CLIENTS) {
+      fprintf(stderr, "uictld: client registry line %d: more than %d entries, "
+                      "ignoring the rest\n",
+              line_no, MAX_REGISTERED_CLIENTS);
+      break;
+    }
+
+    struct client_reg entry;
+    memset(&entry, 0, sizeof(entry));
+    size_t len = strlen(name);
+    if (len >= sizeof(entry.name)) {
+      fprintf(stderr, "uictld: client registry line %d: name too long\n",
+              line_no);
+      continue;
+    }
+    memcpy(entry.name, name, len);
+    /* Same validation the wire gets. A registry entry that could never
+       match a legal HELLO name is a typo, and saying so at startup beats
+       silently never matching. */
+    if (!uictl_client_name_valid(entry.name)) {
+      fprintf(stderr, "uictld: client registry line %d: invalid name\n",
+              line_no);
+      continue;
+    }
+    if (!word || class_from_word(word, &entry.cl) < 0) {
+      fprintf(stderr,
+              "uictld: client registry line %d: expected 'NAME CLASS' with "
+              "CLASS one of untrusted|standard|interactive\n",
+              line_no);
+      continue;
+    }
+    registry[registry_len++] = entry;
+    fprintf(stderr, "uictld: client '%s' registered as '%s'\n", entry.name,
+            class_name(entry.cl));
+  }
+}
+
+/* Unregistered name -> the floor. Default-deny, same posture M4's
+   keyboard allowlist will take. */
+static enum client_class class_for_name(const char *name) {
+  for (int i = 0; i < registry_len; i++)
+    if (strcmp(registry[i].name, name) == 0)
+      return registry[i].cl;
+  return CLASS_UNTRUSTED;
 }
 
 static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
@@ -218,6 +411,28 @@ struct conn {
      reaper; nothing consumes it yet. */
   time_t frame_since;
 
+  /* --- handshake state (M3.6 task 2) -------------------------------
+     Set once by OP_HELLO and never again on this connection — see the
+     duplicate-HELLO refusal in conn_handle_frame. Scoped to the
+     connection, not the pid: two connections from one process may
+     legitimately be different consumers of a future client library, and
+     a pid is not an identity anyway (they recycle).
+
+     proto_min/proto_max are recorded but not yet acted on; task 4 turns
+     the header's version-equality check into a range intersection. */
+  int hello_seen;
+  uint16_t proto_min;
+  uint16_t proto_max;
+  /* 0 until a HELLO succeeds. Once set, every later frame on this
+     connection must carry exactly this version — see conn_version_ok. */
+  uint16_t proto_selected;
+  char client_name[UICTL_CLIENT_NAME_MAX];
+  /* Derived by the daemon, never sent by the peer. Starts at the floor
+     at accept and is only ever raised by a successful HELLO whose name
+     the local registry lists. M4's rate limiter reads this; it must
+     never read source_tag. */
+  enum client_class cl;
+
   /* Operator introspection only (M3.7 task 4 / SIGUSR1). Deliberately
      not policy inputs: a rate limit keyed on frames_served would be a
      policy decision made below the identity layer, which is the mistake
@@ -266,6 +481,17 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     c->frame_since = 0;
     c->accepted_at = mono_secs();
     c->frames_served = 0;
+    c->hello_seen = 0;
+    c->proto_min = 0;
+    c->proto_max = 0;
+    c->proto_selected = 0;
+    /* The floor is assigned at accept, before the peer has said
+       anything at all — identity that starts permissive and gets
+       narrowed later is how a race becomes a privilege. */
+    c->cl = CLASS_UNTRUSTED;
+    /* Not just [0] = '\0': the whole array is compared and printed, and
+       a reused slot must not carry a previous peer's name in its tail. */
+    memset(c->client_name, 0, sizeof(c->client_name));
     return c;
   }
   return NULL; /* table full — caller refuses the connection */
@@ -349,14 +575,40 @@ static void deny_and_close(int cfd, uint16_t result) {
 
 /* Stage a response into the connection's out buffer. The request header
    is echoed (version, opcode, source_tag, seq) so the client can match
-   the reply to its request; only payload_len is rewritten. */
-static void conn_reply(struct conn *c, uint16_t result) {
+   the reply to its request; only payload_len is rewritten.
+
+   `data` is the opcode-specific answer that follows the result code, and
+   may be NULL/0 — which is every opcode today, and stays the shape of
+   every pure command. OP_HELLO is what this exists for.
+
+   Callers must not be able to overflow the out buffer by handing over a
+   long answer, so an oversized one is refused rather than truncated: a
+   truncated frame is worse than an error, because the length prefix
+   would no longer describe the bytes and the stream would desync. This
+   is a daemon bug if it ever fires, hence ERR_INTERNAL. */
+static void conn_reply_data(struct conn *c, uint16_t result, const void *data,
+                            size_t len) {
+  if (len > UICTL_MAX_RESP_DATA) {
+    fprintf(stderr, "uictld: reply payload %zu too large for op %u\n", len,
+            c->hdr.opcode);
+    result = ERR_INTERNAL;
+    data = NULL;
+    len = 0;
+  }
+
   struct uictl_frame_header resp = c->hdr;
-  resp.payload_len = sizeof(uint16_t);
+  resp.payload_len = (uint32_t)(UICTL_RESULT_SIZE + len);
   encode_frame_header(&resp, c->out);
-  memcpy(c->out + HDR_SIZE, &result, sizeof(result));
-  c->out_len = HDR_SIZE + sizeof(result);
+  memcpy(c->out + HDR_SIZE, &result, UICTL_RESULT_SIZE);
+  if (len)
+    memcpy(c->out + HDR_SIZE + UICTL_RESULT_SIZE, data, len);
+  c->out_len = HDR_SIZE + UICTL_RESULT_SIZE + len;
   c->out_sent = 0;
+}
+
+/* A bare acknowledgement: result code, no answer. */
+static void conn_reply(struct conn *c, uint16_t result) {
+  conn_reply_data(c, result, NULL, 0);
 }
 
 /* Push as much of the staged response as the socket will take.
@@ -465,10 +717,99 @@ static void conn_writable(int epfd, struct conn *c) {
 }
 
 /* One complete, size-validated frame is in c->hdr + c->buf. */
+/* The daemon's self-description, answered to every accepted HELLO
+   (M3.6 task 3). Built once per call rather than held in a static so
+   the fields stay next to the code that justifies them; it is 24 bytes.
+
+   The two bitmaps are the contract. `daemon_version` is deliberately
+   *not* — a client that branches on it is feature-sniffing, and the
+   whole point of shipping a capability map is that it never has to. */
+static struct uictl_resp_hello daemon_capabilities(uint16_t proto_selected) {
+  struct uictl_resp_hello r = {
+      .proto_selected = proto_selected,
+      /* Only the absolute pointer exists today. Keyboard is M4, buttons
+         and relative motion are M5.5 — a client asking "do you have
+         buttons yet?" gets a truthful no, which is exactly the question
+         G3 says muvor needs to be able to ask. */
+      .device_caps = CAP_POINTER_ABS,
+      .abs_range_max = (uint32_t)ABS_RANGE_MAX,
+      .opcode_bitmap = UICTL_OP_BIT(OP_PING) | UICTL_OP_BIT(OP_MOVE_ABS) |
+                       UICTL_OP_BIT(OP_HELLO),
+      .daemon_version = UICTL_DAEMON_VERSION,
+      .reserved = 0,
+  };
+  return r;
+}
+
+/* May this connection send a frame stamped with this version?
+   (M3.6 task 4 — replaces a bare `version != UICTL_PROTO_VERSION`.)
+
+   Two regimes, and the second is the one that matters. Before HELLO,
+   anything the daemon speaks is admissible — a client has to be able to
+   get a frame in to negotiate at all. After HELLO the version is
+   *pinned* to what was selected: allowing a client to hop versions
+   mid-connection would mean the same opcode could carry two different
+   payload layouts on one stream, and the daemon would be guessing which
+   one it just parsed. Negotiation that can be revised isn't
+   negotiation. */
+static int conn_version_ok(const struct conn *c, uint16_t version,
+                           uint16_t opcode) {
+  if (c->proto_selected != 0)
+    return version == c->proto_selected;
+  /* The bootstrap exemption. An un-negotiated HELLO is admitted at any
+     version, because the alternative makes negotiation impossible for
+     the only clients that need it: a client whose range excludes ours
+     cannot send a frame we would admit, and cannot learn to until it has
+     asked. Refusing it here would leave the intersection below
+     unreachable — the frame would die at the header, and "we disagree
+     about versions" would be indistinguishable from "your frame is
+     garbage". The envelope is fixed across versions and payload_len is
+     still bounded, so admitting it costs nothing. */
+  if (opcode == OP_HELLO)
+    return 1;
+  return version >= UICTL_PROTO_MIN && version <= UICTL_PROTO_MAX;
+}
+
 static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
   uint16_t result;
-  char args[64];
+  /* 128, not 64: a 31-char client name plus the negotiated version, the
+     range it asked for and its class does not fit in 64, and snprintf
+     would truncate the *class* — the policy-relevant half — off the end
+     of the one record that is supposed to explain a decision. */
+  char args[128];
   args[0] = '\0';
+
+  /* Most opcodes are commands and answer with a bare result. An opcode
+     that answers a *question* points these at its payload before the
+     shared reply at the bottom. */
+  const void *resp_data = NULL;
+  size_t resp_len = 0;
+  struct uictl_resp_hello caps; /* must outlive the switch */
+
+  /* Handshake enforcement (M3.6 task 7). Checked BEFORE the opcode
+     switch, so an un-handshaked peer is told to handshake rather than
+     told which opcodes exist — the refusal reveals nothing about the
+     daemon's surface, and there is exactly one thing it can do next.
+     ERR_OPCODE_UNKNOWN for an unknown opcode is a post-handshake answer.
+
+     OP_PING is exempt on purpose: it stays usable as a bare liveness
+     probe, which is what a supervisor, a health check or `uictl ping`
+     wants, and it neither reads state nor touches the device. OP_HELLO
+     is exempt for the obvious reason. Everything else — every opcode
+     that has ever moved the pointer or will ever press a key — goes
+     through the handshake, because that is where the class M4's policy
+     reads gets derived. Without this, a client skips HELLO and operates
+     at whatever the un-negotiated default is, forever. */
+  if (!c->hello_seen && c->hdr.opcode != OP_HELLO &&
+      c->hdr.opcode != OP_PING) {
+    audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
+              c->hdr.opcode, c->hdr.seq, ERR_HANDSHAKE_REQUIRED, "no hello");
+    /* Per-frame, not fatal: the frame was fully consumed, so the next
+       boundary is known and the client can simply say HELLO and retry
+       on this same connection. */
+    conn_reply(c, ERR_HANDSHAKE_REQUIRED);
+    return;
+  }
 
   switch (c->hdr.opcode) {
   case OP_PING:
@@ -494,6 +835,100 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     result = (uinput_move_abs(uinput_fd, mv.x, mv.y) < 0) ? ERR_INTERNAL : OK;
     break;
   }
+  case OP_HELLO: {
+    /* >=, not ==, for the same reason the client accepts a longer
+       response: HELLO is the bootstrap frame, so a v2 client's longer
+       HELLO must still be readable by a v1 daemon — otherwise it gets
+       ERR_PAYLOAD_INVALID and never learns that the real disagreement
+       was about versions. The prefix is fixed forever; the tail is
+       whatever a newer version appended and is ignored here. */
+    if (c->hdr.payload_len < sizeof(struct uictl_payload_hello)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    /* One HELLO per connection, and it is terminal, not retryable. A
+       second one would let a client rename itself *after* the daemon has
+       attached a class to the first name — which is exactly the
+       per-frame self-assertion (G2) this frame exists to replace. The
+       connection is the scope of the handshake; a client that wants a
+       different identity opens a different connection. */
+    if (c->hello_seen) {
+      result = ERR_DENIED_BY_POLICY;
+      snprintf(args, sizeof(args), "duplicate hello name=%s", c->client_name);
+      break;
+    }
+
+    struct uictl_payload_hello hello;
+    decode_hello(c->buf, &hello);
+
+    if (!uictl_client_name_valid(hello.client_name)) {
+      /* Deliberately does NOT echo the offending name — it just failed
+         the check that makes it safe to put in a newline-delimited log. */
+      result = ERR_PAYLOAD_INVALID;
+      snprintf(args, sizeof(args), "bad client name");
+      break;
+    }
+    if (hello.proto_min > hello.proto_max) {
+      result = ERR_PAYLOAD_INVALID;
+      snprintf(args, sizeof(args), "inverted proto range %u-%u",
+               hello.proto_min, hello.proto_max);
+      break;
+    }
+    /* The frame is self-describing, so it must not contradict itself:
+       a client claiming to speak 2-3 while stamping this very header
+       version 1 has a bug, and guessing which half to believe is how a
+       negotiation ends up with two disagreeing parties who both think
+       they succeeded. */
+    if (c->hdr.version < hello.proto_min || c->hdr.version > hello.proto_max) {
+      result = ERR_PAYLOAD_INVALID;
+      snprintf(args, sizeof(args), "header v%u outside declared %u-%u",
+               c->hdr.version, hello.proto_min, hello.proto_max);
+      break;
+    }
+
+    /* The intersection (M3.6 task 4). Highest mutually supported wins:
+       both sides claim to speak everything in their range, so the newest
+       common version is the one with the most features and no downside.
+
+       ERR_VERSION here is a *per-frame* error, not the fatal kind the
+       header check raises. The difference is whether the next frame
+       boundary is knowable: a bad header version means payload_len is
+       untrustworthy and the stream is lost, whereas here the payload was
+       already read and validated, so the connection survives. It stays
+       usable on purpose — hello_seen is only set on success, so a client
+       may retry HELLO with a different range on the same connection. */
+    uint16_t lo = hello.proto_min > UICTL_PROTO_MIN ? hello.proto_min
+                                                    : (uint16_t)UICTL_PROTO_MIN;
+    uint16_t hi = hello.proto_max < UICTL_PROTO_MAX ? hello.proto_max
+                                                    : (uint16_t)UICTL_PROTO_MAX;
+    if (lo > hi) {
+      result = ERR_VERSION;
+      snprintf(args, sizeof(args), "no overlap: client %u-%u daemon %u-%u",
+               hello.proto_min, hello.proto_max, UICTL_PROTO_MIN,
+               UICTL_PROTO_MAX);
+      break;
+    }
+
+    c->proto_min = hello.proto_min;
+    c->proto_max = hello.proto_max;
+    c->proto_selected = hi;
+    memcpy(c->client_name, hello.client_name, sizeof(c->client_name));
+    c->cl = class_for_name(c->client_name);
+    c->hello_seen = 1;
+
+    caps = daemon_capabilities(c->proto_selected);
+    resp_data = &caps;
+    resp_len = sizeof(caps);
+
+    /* Both halves: the range the client asked for is its *intent*, the
+       selected version and derived class are the daemon's *decision*.
+       Security rule 5 wants the first; a policy audit needs the second. */
+    snprintf(args, sizeof(args), "name=%s proto=%u asked=%u-%u class=%s",
+             c->client_name, c->proto_selected, c->proto_min, c->proto_max,
+             class_name(c->cl));
+    result = OK;
+    break;
+  }
   default:
     result = ERR_OPCODE_UNKNOWN;
     break;
@@ -501,7 +936,13 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
 
   audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
             c->hdr.opcode, c->hdr.seq, result, args);
-  conn_reply(c, result);
+  /* An answer rides along only on success: an error response is a bare
+     result code for every opcode, so a client never has to decide
+     whether a failed request left it a half-filled struct. */
+  if (result == OK)
+    conn_reply_data(c, result, resp_data, resp_len);
+  else
+    conn_reply(c, result);
 }
 
 /* Drain what is readable on this connection, dispatching each frame as
@@ -553,7 +994,7 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
          length into a 4 KB buffer, so it MUST be bounded before it is
          copied into c->want. */
       uint16_t fatal = 0;
-      if (c->hdr.version != UICTL_PROTO_VERSION)
+      if (!conn_version_ok(c, c->hdr.version, c->hdr.opcode))
         fatal = ERR_VERSION;
       else if (c->hdr.payload_len > UICTL_MAX_PAYLOAD)
         fatal = ERR_TOO_LARGE;
@@ -713,12 +1154,15 @@ static void conn_dump_table(void) {
                         : c->phase == CONN_WANT_PAYLOAD
                             ? "payload"
                             : "hdr";
+    /* "-" for a peer that has not said HELLO. Safe to print unquoted:
+       uictl_client_name_valid() is what let it be stored at all. */
     fprintf(stderr,
-            "  slot=%2d gen=%u fd=%d pid=%d uid=%u phase=%s(%zu/%zu) "
-            "reply=%zu/%zu age=%llds frames=%llu\n",
+            "  slot=%2d gen=%u fd=%d pid=%d uid=%u name=%s class=%s "
+            "phase=%s(%zu/%zu) reply=%zu/%zu age=%llds frames=%llu\n",
             i, c->generation, c->fd, (int)c->cred.pid, (unsigned)c->cred.uid,
-            phase, c->have, c->want, c->out_sent, c->out_len,
-            (long long)(now - c->accepted_at),
+            c->hello_seen ? c->client_name : "-", class_name(c->cl), phase,
+            c->have, c->want,
+            c->out_sent, c->out_len, (long long)(now - c->accepted_at),
             (unsigned long long)c->frames_served);
   }
   fflush(stderr);
@@ -914,6 +1358,9 @@ int main(void) {
   epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev);
 
   conn_table_init(); /* fd = -1 in every slot; 0 would alias stdin */
+  /* Before the first accept, so no connection can be classified against
+     a half-loaded registry. */
+  load_client_registry();
 
   printf("uictld: listening on %s\n", path);
   fflush(stdout);
