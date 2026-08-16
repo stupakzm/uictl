@@ -13,6 +13,7 @@
 #include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
@@ -128,7 +129,39 @@ static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
 #define CONN_BUF_SIZE UICTL_MAX_PAYLOAD /* header phase reuses this buffer */
 #define CONN_OUT_SIZE (HDR_SIZE + UICTL_MAX_PAYLOAD)
 
+/* How long a *half-delivered frame* may sit before the connection is
+   reaped, and how often the reaper scans. The effective deadline is
+   therefore 5–6 s, not exactly 5 — a frame that goes quiet just after a
+   tick waits nearly a full extra tick for the next one. Do not tighten
+   the tick to hide that; a coarse periodic scan is the point. */
+#define CONN_PARTIAL_TIMEOUT_SEC 5
+#define REAPER_TICK_SEC 1
+
 enum conn_phase { CONN_WANT_HEADER, CONN_WANT_PAYLOAD };
+
+/* ---- epoll event keys ------------------------------------------------
+   `epoll_event.data` is a union and the obvious choice, `.fd`, is a trap
+   here. fd numbers are recycled: the kernel hands out the lowest free
+   one, so the instant conn_close() closes fd 9, the very next accept4()
+   in the SAME epoll_wait batch can be handed 9 again. A later event in
+   that batch still says "fd 9" and would resolve to the brand-new
+   connection — delivering a dead peer's EPOLLHUP, or an EPOLLIN, to a
+   client that just connected.
+
+   So an event key names the connection *object*, not its fd:
+
+     bits 63..32  generation — 0 for the three static fds, >= 1 for conns
+     bits 31..0   the fd for static sources, the conns[] slot for clients
+
+   The generation is bumped on every conn_alloc, so a stale event for a
+   reused slot fails the match and is dropped. Generation 0 is reserved
+   for the static sources, which is what makes one decode cover both
+   kinds without a separate tag field. Wraparound needs 2^32 accepts
+   between two events of one batch — not reachable. */
+#define EVKEY_STATIC(fd) ((uint64_t)(uint32_t)(fd))
+#define EVKEY_CONN(slot, gen) (((uint64_t)(gen) << 32) | (uint32_t)(slot))
+#define EVKEY_GEN(u) ((uint32_t)((u) >> 32))
+#define EVKEY_LOW(u) ((uint32_t)((u) & 0xffffffffu))
 
 struct conn {
   int fd;            /* < 0 => slot free. the ONLY free marker.        */
@@ -141,11 +174,26 @@ struct conn {
   struct uictl_frame_header hdr; /* valid only in CONN_WANT_PAYLOAD    */
   char buf[CONN_BUF_SIZE];
 
-  /* --- write side --- M3.5 task 7 turns this into EPOLLOUT-driven --- */
+  /* --- write side --- invariant: out_sent <= out_len <= sizeof(out).
+     A response is pending iff out_sent < out_len. There is exactly ONE
+     out buffer, so while a response is pending the connection must not
+     parse another frame — the next reply would overwrite the one still
+     going out. That is enforced by dropping EPOLLIN, see
+     conn_update_events. --------------------------------------------- */
   char out[CONN_OUT_SIZE];
   size_t out_len;
   size_t out_sent;
   int close_after_flush; /* fatal frame: finish the reply, then close  */
+  time_t out_since;      /* mono secs when the response first stalled  */
+
+  /* What this fd is currently registered for in the epoll set. Cached so
+     conn_update_events can skip a redundant EPOLL_CTL_MOD syscall on the
+     common path where nothing changed. */
+  uint32_t events;
+
+  /* Bumped every time this slot is handed to a new peer. Makes a stale
+     epoll event for a previous occupant identifiable. */
+  uint32_t generation;
 
   /* CLOCK_MONOTONIC seconds when the current frame's first byte
      arrived. Valid only while a frame is in progress, i.e.
@@ -168,11 +216,19 @@ static void conn_table_init(void) {
     conns[i].fd = -1;
 }
 
+/* Monotonic, never reset, never 0 for a live connection — see
+   EVKEY_CONN. Starts at 1 so the first allocation is distinguishable
+   from the zero-initialised `generation` of an untouched slot. */
+static uint32_t conn_generation_next = 1;
+
 static struct conn *conn_alloc(int fd, const struct ucred *cred) {
   for (int i = 0; i < MAX_CONNS; i++) {
     if (conns[i].fd >= 0)
       continue;
     struct conn *c = &conns[i];
+    c->generation = conn_generation_next++;
+    if (conn_generation_next == 0)
+      conn_generation_next = 1; /* skip 0: reserved for static fds */
     c->fd = fd;
     c->cred = *cred;
     c->phase = CONN_WANT_HEADER;
@@ -181,17 +237,30 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     c->out_len = 0;
     c->out_sent = 0;
     c->close_after_flush = 0;
+    c->out_since = 0;
+    c->events = EPOLLIN; /* caller registers with exactly this */
     c->frame_since = 0;
     return c;
   }
   return NULL; /* table full — caller refuses the connection */
 }
 
-static struct conn *conn_find(int fd) {
-  for (int i = 0; i < MAX_CONNS; i++)
-    if (conns[i].fd == fd)
-      return &conns[i];
-  return NULL;
+static uint64_t conn_evkey(const struct conn *c) {
+  return EVKEY_CONN(c - conns, c->generation);
+}
+
+/* Resolve an epoll event back to the connection that registered it, or
+   NULL if that connection is gone. Replaces the old conn_find(fd) scan:
+   this cannot alias, because the key carries the generation the event
+   was registered under. */
+static struct conn *conn_from_evkey(uint64_t key) {
+  uint32_t slot = EVKEY_LOW(key);
+  if (slot >= MAX_CONNS)
+    return NULL;
+  struct conn *c = &conns[slot];
+  if (c->fd < 0 || c->generation != EVKEY_GEN(key))
+    return NULL; /* closed, or the slot has since been reused */
+  return c;
 }
 
 static void conn_close(int epfd, struct conn *c) {
@@ -210,6 +279,8 @@ static void conn_close(int epfd, struct conn *c) {
   c->want = 0;
   c->out_len = 0;
   c->out_sent = 0;
+  c->out_since = 0;
+  c->events = 0;
 }
 
 /* Best-effort refusal for a peer that never becomes a conn (bad uid,
@@ -240,21 +311,109 @@ static void conn_reply(struct conn *c, uint16_t result) {
   c->out_sent = 0;
 }
 
-/* Returns -1 if the response could not be fully written. Responses are
-   18 bytes and the socket buffer is ~200 KB, so a partial write means
-   the peer is pathological; closing is the safe answer until task 7
-   gives us a real EPOLLOUT path. Notably we do NOT spin on EAGAIN. */
+/* Push as much of the staged response as the socket will take.
+     0  -> fully drained, out buffer is free again
+     1  -> bytes remain; caller must arm EPOLLOUT and stop reading
+    -1  -> fatal socket error, connection is dead
+   Never spins on EAGAIN and never loops waiting for the peer: a client
+   that stops reading must cost us one failed write() and nothing more.
+   (M3.5 task 7. Before this, a partial write just killed the connection
+   — correct but wrong: 18 bytes into a ~200KB socket buffer only fails
+   when the peer is misbehaving *or* is a legitimate pipelining client
+   that has queued thousands of frames without reading the replies.) */
 static int conn_flush(struct conn *c) {
   while (c->out_sent < c->out_len) {
     ssize_t w = write(c->fd, c->out + c->out_sent, c->out_len - c->out_sent);
     if (w < 0) {
       if (errno == EINTR)
         continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return 1;
       return -1;
     }
     c->out_sent += (size_t)w;
   }
+  /* Drained. Clearing both makes `out_sent < out_len` the single
+     authoritative "response pending" test everywhere else. */
+  c->out_len = 0;
+  c->out_sent = 0;
+  c->out_since = 0;
   return 0;
+}
+
+/* Point the epoll registration at whichever half of the socket we
+   actually care about. EPOLLIN and EPOLLOUT are mutually exclusive here,
+   and that is deliberate:
+
+   - While a response is pending we must not parse another frame (one out
+     buffer), so we stop reading. But merely *not calling read()* is not
+     enough — this epoll set is level-triggered, so unread bytes sitting
+     in the receive buffer would be re-reported on every single
+     epoll_wait and spin the daemon at 100%. EPOLLIN has to come off the
+     registration, not just be ignored.
+   - Conversely, arming EPOLLOUT when nothing is queued is the classic
+     busy-loop: a writable socket is almost always writable. */
+static int conn_update_events(int epfd, struct conn *c) {
+  uint32_t want = (c->out_sent < c->out_len) ? (uint32_t)EPOLLOUT
+                                             : (uint32_t)EPOLLIN;
+  if (want == c->events)
+    return 0; /* nothing to do; skip the syscall */
+  /* MOD replaces `data` as well as `events`, so the key must be rebuilt
+     identically — a MOD that dropped back to .fd would silently undo the
+     aliasing fix. */
+  struct epoll_event ev = {.events = want, .data.u64 = conn_evkey(c)};
+  if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) < 0) {
+    perror("uictld: epoll_ctl MOD client");
+    return -1;
+  }
+  c->events = want;
+  return 0;
+}
+
+/* Common tail for "we just staged (and tried to send) a response".
+   Returns 0 if the connection survives and may keep parsing, -1 if it
+   was closed. */
+static int conn_after_flush(int epfd, struct conn *c, int flushed) {
+  if (flushed < 0) { /* dead socket */
+    conn_close(epfd, c);
+    return -1;
+  }
+  if (flushed > 0) { /* still queued: wait for EPOLLOUT */
+    if (c->out_since == 0)
+      c->out_since = mono_secs(); /* start the stall clock */
+    if (conn_update_events(epfd, c) < 0) {
+      conn_close(epfd, c);
+      return -1;
+    }
+    return -1; /* survives, but the caller must stop reading */
+  }
+  if (c->close_after_flush) { /* fatal frame, reply delivered */
+    conn_close(epfd, c);
+    return -1;
+  }
+  return 0;
+}
+
+/* The peer drained enough of its receive buffer for us to continue. */
+static void conn_writable(int epfd, struct conn *c) {
+  int flushed = conn_flush(c);
+  if (flushed < 0) {
+    conn_close(epfd, c);
+    return;
+  }
+  if (flushed > 0)
+    return; /* still not drained; EPOLLOUT stays armed */
+  if (c->close_after_flush) {
+    conn_close(epfd, c);
+    return;
+  }
+  /* Re-arm EPOLLIN. We do NOT call conn_readable here: if the peer
+     pipelined more frames while we were blocked, those bytes are already
+     in the receive buffer and level-triggered epoll will hand us an
+     EPOLLIN on the very next epoll_wait. Letting the loop do it keeps
+     this function from recursing into the parser. */
+  if (conn_update_events(epfd, c) < 0)
+    conn_close(epfd, c);
 }
 
 /* One complete, size-validated frame is in c->hdr + c->buf. */
@@ -349,8 +508,12 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
         audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
                   c->hdr.opcode, c->hdr.seq, fatal, "fatal frame");
         conn_reply(c, fatal);
-        (void)conn_flush(c);
-        conn_close(epfd, c);
+        /* Close *after* the error actually reaches the peer, not before.
+           Previously the reply was written best-effort and the socket
+           closed immediately; if it didn't drain, the client learned
+           nothing but "connection reset". */
+        c->close_after_flush = 1;
+        (void)conn_after_flush(epfd, c, conn_flush(c));
         return;
       }
 
@@ -367,16 +530,77 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
     conn_handle_frame(c, uinput_fd, audit_fd);
     int flushed = conn_flush(c);
 
-    /* Reset for the next frame on this same connection. */
+    /* Reset for the next frame on this same connection. Done before the
+       flush verdict is acted on: the request has been fully consumed and
+       answered either way, so the read state is stale regardless of
+       whether the reply made it out. */
     c->phase = CONN_WANT_HEADER;
     c->want = HDR_SIZE;
     c->have = 0;
     explicit_bzero(c->buf, sizeof(c->buf));
 
-    if (flushed < 0 || c->close_after_flush) {
-      conn_close(epfd, c);
+    /* -1 means closed, or queued and waiting on EPOLLOUT. Either way we
+       stop parsing: with one out buffer, handling the next pipelined
+       frame here would clobber the reply still in flight. */
+    if (conn_after_flush(epfd, c, flushed) < 0)
       return;
-    }
+  }
+}
+
+/* A frame is in progress iff we are holding parse state for bytes that
+   have not all arrived. Two cases: mid-header (have > 0, still in
+   CONN_WANT_HEADER), or header complete and payload outstanding
+   (CONN_WANT_PAYLOAD). An idle connection sitting at
+   CONN_WANT_HEADER with have == 0 is NOT in progress — that is the
+   normal resting state of a long-lived client between hotkeys, and
+   reaping it would break the very thing M3.5 exists to support. */
+static int conn_frame_in_progress(const struct conn *c) {
+  return c->have > 0 || c->phase == CONN_WANT_PAYLOAD;
+}
+
+/* One timer, scanned against the whole table — not one timer per
+   connection. At <= 32 slots the scan is cheaper than 32 timerfds, and
+   there is no per-connection fd to leak on close. */
+static void conn_reap_partial(int epfd, int audit_fd) {
+  time_t now = mono_secs();
+  for (int i = 0; i < MAX_CONNS; i++) {
+    struct conn *c = &conns[i];
+    if (c->fd < 0)
+      continue;
+
+    /* Two independent stalls, same deadline.
+
+       A peer that stops *sending* mid-frame leaves us holding parse
+       state (task 6). A peer that stops *reading* leaves us holding an
+       undeliverable reply — a hole task 7 opened, because the old
+       conn_flush killed such a connection on the spot and the new one
+       parks it on EPOLLOUT indefinitely. Both occupy a slot forever, so
+       both are reaped. */
+    const char *why = NULL;
+    if (conn_frame_in_progress(c) &&
+        now - c->frame_since >= CONN_PARTIAL_TIMEOUT_SEC)
+      why = "partial frame timeout";
+    else if (c->out_since != 0 && now - c->out_since >= CONN_PARTIAL_TIMEOUT_SEC)
+      why = "response stalled";
+    if (!why)
+      continue;
+
+    /* c->hdr is only decoded once the header phase completes; in
+       CONN_WANT_HEADER it still holds the previous frame's values, so
+       report zeros rather than auditing stale state as if it were this
+       frame's. (On the stalled-write path hdr *is* this frame's — the
+       reply was built from it — so it reports usefully either way.) */
+    int hdr_valid = (c->phase == CONN_WANT_PAYLOAD) || (c->out_since != 0);
+    uint16_t op = hdr_valid ? c->hdr.opcode : OP_INVALID;
+    uint32_t src = hdr_valid ? c->hdr.source_tag : 0;
+    uint32_t seq = hdr_valid ? c->hdr.seq : 0;
+
+    audit_log(audit_fd, c->cred.pid, c->cred.uid, src, op, seq,
+              ERR_DENIED_BY_POLICY, why);
+    /* No reply attempt. The peer is by definition not talking, so its
+       receive window may be full and a write could block the daemon —
+       which is exactly the failure this whole milestone removes. */
+    conn_close(epfd, c);
   }
 }
 
@@ -520,10 +744,47 @@ int main(void) {
     unlink(path);
     return 1;
   }
-  struct epoll_event ev = {.events = EPOLLIN, .data.fd = sfd};
+  /* CLOCK_MONOTONIC, not CLOCK_REALTIME: an NTP step or a settimeofday
+     must not make the reaper fire early or stall for hours. TFD_NONBLOCK
+     so the mandatory read() below can never park the loop. */
+  int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+  if (tfd < 0) {
+    perror("uictld: timerfd_create");
+    uinput_close(uinput_fd);
+    close(epfd);
+    close(sigfd);
+    close(audit_fd);
+    close(lockfd);
+    close(sfd);
+    unlink(path);
+    return 1;
+  }
+  /* it_value arms the first expiry, it_interval makes it periodic. Leave
+     it_interval zero and the timer fires exactly once — the classic
+     one-shot bug that looks like "the reaper worked, then stopped". */
+  struct itimerspec its = {.it_value = {.tv_sec = REAPER_TICK_SEC},
+                           .it_interval = {.tv_sec = REAPER_TICK_SEC}};
+  if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
+    perror("uictld: timerfd_settime");
+    close(tfd);
+    uinput_close(uinput_fd);
+    close(epfd);
+    close(sigfd);
+    close(audit_fd);
+    close(lockfd);
+    close(sfd);
+    unlink(path);
+    return 1;
+  }
+
+  /* Static sources carry generation 0 in their key, which is what makes
+     them distinguishable from connection keys at dispatch. */
+  struct epoll_event ev = {.events = EPOLLIN, .data.u64 = EVKEY_STATIC(sfd)};
   epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev);
-  ev.data.fd = sigfd;
+  ev.data.u64 = EVKEY_STATIC(sigfd);
   epoll_ctl(epfd, EPOLL_CTL_ADD, sigfd, &ev);
+  ev.data.u64 = EVKEY_STATIC(tfd);
+  epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev);
 
   conn_table_init(); /* fd = -1 in every slot; 0 would alias stdin */
 
@@ -543,7 +804,11 @@ int main(void) {
     }
 
     for (int i = 0; i < nfd; i++) {
-      if (events[i].data.fd == sigfd) {
+      uint64_t key = events[i].data.u64;
+      int is_static = (EVKEY_GEN(key) == 0);
+      int skey = is_static ? (int)EVKEY_LOW(key) : -1;
+
+      if (is_static && skey == sigfd) {
         struct signalfd_siginfo si;
         if (read(sigfd, &si, sizeof(si)) == (ssize_t)sizeof(si))
           fprintf(stderr, "uictld: signal %u, shutting down\n", si.ssi_signo);
@@ -552,7 +817,21 @@ int main(void) {
 
         stop = 1;
         break;
-      } else if (events[i].data.fd == sfd) {
+      } else if (is_static && skey == tfd) {
+        /* MANDATORY. epoll here is level-triggered, so the fd stays
+           readable until the expiration count is consumed; skip this
+           read and the loop spins at 100% CPU forever. The value is the
+           number of expiries since the last read (>1 if we were busy) —
+           we do not care how many, only that a tick happened. */
+        uint64_t expirations;
+        if (read(tfd, &expirations, sizeof(expirations)) !=
+            (ssize_t)sizeof(expirations)) {
+          if (errno != EAGAIN && errno != EWOULDBLOCK)
+            perror("uictld: read timerfd");
+          continue;
+        }
+        conn_reap_partial(epfd, audit_fd);
+      } else if (is_static && skey == sfd) {
         /* Accept until EAGAIN: one EPOLLIN on the listening socket can
            stand for several queued connections, and level-triggered
            epoll would otherwise just fire again. */
@@ -591,7 +870,8 @@ int main(void) {
             continue;
           }
 
-          struct epoll_event cev = {.events = EPOLLIN, .data.fd = cfd};
+          struct epoll_event cev = {.events = EPOLLIN,
+                                    .data.u64 = conn_evkey(c)};
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
             perror("uictld: epoll_ctl ADD client");
             conn_close(epfd, c);
@@ -599,14 +879,20 @@ int main(void) {
           }
         }
       } else {
-        struct conn *c = conn_find(events[i].data.fd);
+        struct conn *c = conn_from_evkey(key);
         if (!c)
-          continue; /* event for an fd we already closed */
+          continue; /* connection closed earlier in this same batch */
         if (events[i].events & (EPOLLHUP | EPOLLERR)) {
           conn_close(epfd, c);
           continue;
         }
-        conn_readable(epfd, c, uinput_fd, audit_fd);
+        /* Only ever one of the two is registered at a time (see
+           conn_update_events), but check both and re-test c->fd:
+           conn_writable can close the connection out from under us. */
+        if (events[i].events & EPOLLOUT)
+          conn_writable(epfd, c);
+        if (c->fd >= 0 && (events[i].events & EPOLLIN))
+          conn_readable(epfd, c, uinput_fd, audit_fd);
       }
     }
   }
@@ -620,6 +906,7 @@ int main(void) {
       conn_close(epfd, &conns[i]);
 
   uinput_close(uinput_fd);
+  close(tfd);
   close(sigfd);
   close(epfd);
   close(sfd);
