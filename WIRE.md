@@ -23,11 +23,280 @@ decisions but is checked by the compiler.
 | 2 | Frame format | *not yet written* |
 | 3 | Handshake | *not yet written* |
 | 4 | Result codes and response classes | *not yet written* |
-| 5 | Opcodes | *not yet written* |
+| 5A | **Opcodes — the pointer** | **normative** |
+| 5B | Opcodes — the keyboard, and `BATCH` | *not yet written* |
 | 6 | Held state | *not yet written* |
 | 7 | Confirmation | *not yet written* |
 | 8 | **Connection lifecycle and restart** | **normative** |
 | 9 | Conformance vectors | *not yet written* |
+
+---
+
+# 5. Opcodes
+
+Split by device, because that is where the real seam is: since M5.5 the
+daemon registers **two** virtual devices, the kernel gives them separate
+event nodes and separate handler lists, and an event frame is atomic per
+device and only per device. A client that only moves the pointer needs
+§5A and nothing else; a client that only types needs §5B and nothing
+else. Neither half references the other.
+
+| § | Opcodes |
+|---|---|
+| 5A | `MOVE_ABS`, `MOVE_REL`, `SCROLL`, `BUTTON` — the pointer |
+| 5B | `KEY_TAP`, `KEY_SEQUENCE`, `KEY_DOWN`, `KEY_UP`, `BATCH` — the keyboard, and the one opcode that spans both |
+
+`PING` and `HELLO` are not here: `PING` is a transport-level liveness
+probe (§1) and `HELLO` is the whole subject of §3. The three `CONFIRM_*`
+opcodes are not here either — they are a flow, not a request shape, and
+one of them travels daemon→client. They are specified in §7.
+
+## 5A. The pointer
+
+All four opcodes write to the device named `uictl virtual pointer`. Its
+name is fixed for all time: compositors key per-device configuration off
+it, so renaming it would silently discard every user's settings.
+
+### 5A.0 The gate every one of these passes
+
+In this order, and the order is normative because a client can tell
+which check refused it from the result code alone:
+
+1. **handshake** — `ERR_HANDSHAKE_REQUIRED` if no `HELLO` on this
+   connection (§3).
+2. **rate limit** — `ERR_RATE_LIMITED`. Charged *before* validation: a
+   client flooding malformed frames is still flooding, and a limiter
+   that counts only well-formed requests fails to limit the case most
+   worth limiting.
+3. **confirmation** — `ERR_CONFIRM_*` if the client's registry role
+   requires a human (§7).
+4. **payload size** — `ERR_PAYLOAD_INVALID`. Exact length, never
+   "at least": a command frame is sent only after the version is pinned,
+   so there is no skew to absorb and a wrong length means a broken
+   client.
+5. **range** — `ERR_PAYLOAD_INVALID`, per opcode below.
+6. **deny-list** — `ERR_KEY_DENYLISTED`. Applies to `BUTTON`; it
+   currently contains no buttons, but the check is not skipped.
+7. **arbitration** — `BUTTON` only, see 5A.4.
+8. **write**, then **record the hold** (`BUTTON` down only).
+
+`ERR_INTERNAL` is possible at step 8 for any of them and means the write
+to `/dev/uinput` failed. It is not retryable in any useful sense: the
+device is gone or the daemon is broken.
+
+**The key allowlist (`~/.config/uictl/policy`) does NOT apply to any
+opcode in 5A.** That file is a list of *keycodes* a user opted into.
+Requiring `272` in it before a client may click would be a default-deny
+with no upside: a click is visible and reversible, the pointer is not a
+destructive surface the way `KEY_POWER` is, and a user who genuinely
+wanted to forbid clicking would have to be told to write a number they
+have no way to look up.
+
+### 5A.1 `MOVE_ABS` — absolute position
+
+```c
+struct uictl_payload_move_abs {
+    int32_t x;
+    int32_t y;
+};                                  /* exactly 8 bytes */
+```
+
+**Coordinate contract: values are DEVICE units, `0 .. abs_range_max`,
+and the client converts.** `abs_range_max` comes from the HELLO response
+and is 32767 today. The daemon never learns the display geometry — not
+the resolution, not the number of monitors, not the layout — and a
+client that wants to click a pixel is responsible for the mapping.
+
+That is a deliberate refusal, not an omission. A daemon that knew screen
+geometry would need to track hotplug, mode changes, scaling and monitor
+arrangement, all through interfaces it has no business holding open, and
+all so that it could do arithmetic the client is better placed to do.
+
+Out-of-range values are **clamped**, not refused: `x < 0` becomes 0,
+`x > abs_range_max` becomes `abs_range_max`, same for `y`. Clamping is
+right here because the coordinate space has a natural edge and "as far
+as it goes" is what the client meant — the same thing a real pointer
+does at the screen edge.
+
+The audit log records the value **as asked, before clamping**, because
+the audit records intent (security rule 5) and the intent is the number
+the client sent.
+
+Results: `OK`, or `ERR_PAYLOAD_INVALID` for a wrong-sized payload.
+Any in-range or out-of-range coordinate pair succeeds.
+
+### 5A.2 `MOVE_REL` — relative nudge
+
+```c
+struct uictl_payload_move_rel {
+    int32_t dx;
+    int32_t dy;
+};                                  /* exactly 8 bytes */
+```
+
+Positive `dx` is right, positive `dy` is down — kernel convention, not a
+screen convention.
+
+**Out of range is an error here, not a clamp**, and the difference from
+`MOVE_ABS` is the point. A relative delta has no natural ceiling to
+clamp *to*. Silently shrinking a nudge of 100000 to 32767 would move the
+pointer a different distance than the client asked for and report `OK`,
+leaving the client to discover the discrepancy by looking at the screen.
+In range is exact; out of range is refused.
+
+- `|dx| > abs_range_max` or `|dy| > abs_range_max` → `ERR_PAYLOAD_INVALID`
+- `dx == 0 && dy == 0` → `ERR_PAYLOAD_INVALID`
+
+A zero nudge is refused rather than treated as a no-op because it is
+always a client bug and because the input core would discard the empty
+frame anyway — returning `OK` for a request that provably did nothing is
+the failure mode §8.8 objects to.
+
+Results: `OK`, `ERR_PAYLOAD_INVALID`.
+
+### 5A.3 `SCROLL` — wheel notches
+
+```c
+struct uictl_payload_scroll {
+    int32_t notches_v;              /* + = up    */
+    int32_t notches_h;              /* + = right */
+};                                  /* exactly 8 bytes */
+```
+
+**Notches, not pixels.** One notch is one detent of a physical wheel.
+The daemon emits both the classic notch event and the hi-res value the
+kernel expects alongside it; a client never has to know that, and MUST
+NOT try to send hi-res values itself.
+
+Bounds are `±1000` on each axis — far below the `int32` range, and
+deliberately so: the hi-res value is 120× the notch count, and a client
+asking for 20 million notches would overflow it. Such a client is
+broken, not scrolling.
+
+- `|notches_v| > 1000` or `|notches_h| > 1000` → `ERR_PAYLOAD_INVALID`
+- both zero → `ERR_PAYLOAD_INVALID`, same reasoning as `MOVE_REL`
+
+Both axes may be non-zero in one request; they are emitted in one frame.
+
+Results: `OK`, `ERR_PAYLOAD_INVALID`.
+
+### 5A.4 `BUTTON` — press and release
+
+```c
+struct uictl_payload_button {
+    uint16_t code;                  /* BTN_* */
+    uint8_t  down;                  /* 1 = press, 0 = release */
+    uint8_t  reserved;              /* MUST be zero */
+};                                  /* exactly 4 bytes */
+```
+
+`reserved != 0` or `down > 1` → `ERR_PAYLOAD_INVALID`. The daemon
+validates the padding byte rather than ignoring it, so that it stays
+available for a future field instead of being quietly filled with
+whatever clients happened to leave there.
+
+**Valid codes are exactly the five the pointer device registered:**
+
+| Code | Name |
+|---|---|
+| 272 | `BTN_LEFT` |
+| 273 | `BTN_RIGHT` |
+| 274 | `BTN_MIDDLE` |
+| 275 | `BTN_SIDE` |
+| 276 | `BTN_EXTRA` |
+
+Anything else → `ERR_PAYLOAD_INVALID`, including keycodes that are
+perfectly valid for §5B. The keyboard device does not register these and
+the pointer device does not register keys; the two sets are disjoint by
+construction, from one list in the daemon that the pointer registers,
+the keyboard skips, and the router switches on.
+
+#### `BUTTON` is held state
+
+A press is not an event, it is a **hold**, and it is recorded in the same
+per-connection bitset as held keys (§6). Everything in §6 applies
+unchanged: arbitration between connections, release on every path a
+connection ends, the dead-man timer, and the cap on simultaneous holds.
+
+That reuse is only correct because `BTN_*` codes live in the kernel's
+keycode space — which is why the held bitset is sized `0..KEY_MAX`
+rather than by a count of keys.
+
+Press (`down = 1`):
+
+- already held by this connection → `ERR_KEY_ALREADY_HELD`
+- held by another connection → `ERR_KEY_HELD_BY_OTHER` (retryable; back
+  off, the other client is mid-gesture)
+- this connection is at the hold cap → `ERR_TOO_MANY_HELD`
+
+Release (`down = 0`):
+
+- not held by this connection → `ERR_KEY_NOT_HELD`, **except** for the
+  forgiving window in §8.3.1, where a release on a connection that has
+  never held anything returns `OK` and writes nothing.
+
+#### A release is never refused for a policy reason
+
+The release path is the thinnest gate in the daemon: size, range, "do
+you hold it", write. **No rate limit** — a button *down* is charged
+against the client's budget and a button *up* is not.
+
+The reasoning is a safety one rather than a generosity. A client that has
+spent its budget holding a button must still be able to let go; charging
+the release means the way to produce a stuck button is to be slightly too
+fast. Never make the escape hatch depend on the resource that ran out.
+Policy already had its say on the press — nothing can be held that was
+not allowed — so re-asking on the way up can only ever *create* a stuck
+button, never prevent one.
+
+Results: `OK`, `ERR_PAYLOAD_INVALID`, `ERR_KEY_DENYLISTED`,
+`ERR_KEY_ALREADY_HELD`, `ERR_KEY_HELD_BY_OTHER`, `ERR_KEY_NOT_HELD`,
+`ERR_TOO_MANY_HELD`, `ERR_RATE_LIMITED` (press only), `ERR_INTERNAL`.
+
+### 5A.5 What the audit log records
+
+`MOVE_ABS`, `MOVE_REL` and `SCROLL` are **coalesced**: one line per
+second per (pid, opcode), recording the count and the last values, not
+one line per request. A drag at 60 Hz would otherwise produce 60 audit
+lines a second and bury the events an operator actually cares about.
+
+`BUTTON` is **never coalesced**. Every press and release keeps its own
+line forever, on the same principle as keys: a click is a discrete act a
+user might need to account for, and motion is not.
+
+Only **successful** motion is coalesced. Every refused `MOVE_ABS`,
+`MOVE_REL` or `SCROLL` takes the normal path and gets its own line — the
+coalescing exists to stop a working client burying the log, not to hide
+a broken one.
+
+A burst shorter than one second still gets its own line when it ends —
+the accumulator flushes on a one-second tick, so granularity is one
+second, not one burst.
+
+### 5A.6 A worked client
+
+Everything a pointer client does, in order, with nothing omitted:
+
+```
+connect()                        AF_UNIX, $XDG_RUNTIME_DIR/uictld.sock
+HELLO                            mandatory; read abs_range_max and
+                                 opcode_bitmap from the reply (§3)
+  check bit MOVE_ABS etc. are set in opcode_bitmap before using them
+MOVE_ABS  x*32767/screen_w, y*32767/screen_h
+BUTTON    272 down=1
+MOVE_REL  dx dy                  ... the drag
+BUTTON    272 down=0
+close()                          any hold still open is released here
+```
+
+A client MUST gate on `opcode_bitmap`, never on `daemon_version` or the
+protocol version. Feature-sniffing by version number is how a protocol
+acquires a compatibility matrix nobody can test.
+
+If the connection drops anywhere in that sequence, §8 applies in full:
+the button is released by the daemon, the client's held set is empty,
+nothing is replayed, and the next connection starts with a fresh
+`HELLO`.
 
 ---
 
