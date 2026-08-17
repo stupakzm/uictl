@@ -261,8 +261,8 @@ compositor bug. Implementations MUST make it visible:
 
 ## 8.9 Implementation status
 
-This section is normative for protocol version 1, but not all of it is
-implemented in daemon 0.3.0.
+This section is normative for protocol version 1. Everything in it is
+implemented in daemon 0.3.0 except where noted.
 
 | Rule | Status |
 |---|---|
@@ -272,6 +272,16 @@ implemented in daemon 0.3.0.
 | 8.4 mandatory re-HELLO | shipped (`ERR_HANDSHAKE_REQUIRED`) |
 | 8.5 no replay | client-side rule; no daemon change needed |
 | 8.6 advertised reconnect policy | shipped — HELLO response is 32 bytes; `tests/test_m36_identity.py` GG |
-| 8.7 admission backstop | **not implemented** |
-| 8.8 daemon logging | partial — release is logged, activation is not |
-| 8.8 library/CLI visibility | **not implemented** — no `libuictl` yet |
+| 8.7 admission backstop | shipped (`attempt_admit`, 60 attempts / 10 s per pid); `tests/test_wire87_storm.py` |
+| 8.8 daemon logging | shipped for start and release; socket activation lands with M6 |
+| 8.8 CLI exit codes | shipped — 1 usage, 2 unreachable, 3 refused, 4 reserved for dropped |
+| 8.8 library callback | **blocked** — there is no `libuictl` yet (M-lib 2) |
+
+Two entries are not "shipped" and neither is a gap in §8:
+
+- **Socket activation logging** has nothing to log until M6 introduces
+  `uictld.socket`. The start line it would extend already exists.
+- **The library callback** cannot be written before `libuictl` exists
+  (M-lib 2). The rule stays normative so that the library is built to it
+  rather than having it retrofitted, which is the same reason §8 was
+  written before M6 rather than during it.

@@ -709,6 +709,7 @@ static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
 #define CONN_FRAMES_PER_TURN 32
 #define MAX_CONNS_PER_PID 4
 
+
 enum conn_phase { CONN_WANT_HEADER, CONN_WANT_PAYLOAD };
 
 /* Same keyspace as the allowlist, and the same reasons for a bitset:
@@ -1351,6 +1352,93 @@ static int conn_held_selftest(void) {
     bad = 1;
   }
   return bad;
+}
+
+/* ---- connection-attempt backstop (WIRE.md §8.7) ---------------------
+   MAX_CONNS_PER_PID bounds how many connections a pid holds AT ONCE. It
+   says nothing about how fast a pid may open and close them, and under
+   socket activation that is the gap that matters: connect() succeeds
+   whether or not a daemon is running, so a client whose reconnect loop
+   has no backoff will spin as fast as the scheduler allows and each
+   attempt is, individually, within every limit the daemon has.
+
+   §8.6's advertised advice does not close this. It cannot: it is read by
+   the client, in the client's process, at the moment the daemon is
+   least able to influence anything. This is the enforcing half, and the
+   only rule in §8 that survives a client ignoring everything else.
+
+   Sliding window per pid, not a token bucket. A bucket would let a
+   client trickle at exactly the refill rate forever, which is the
+   behaviour of a broken retry loop and precisely what should be
+   refused. The window asks a blunter question -- "how many attempts in
+   the last N seconds" -- and a client obeying any backoff at all cannot
+   reach it: 100 ms doubling gives ~7 attempts in the first 10 seconds.
+
+   The CLI is unaffected by construction. Every `uictl` invocation is a
+   new process, so a new pid, so a fresh window; the budget is spent only
+   by one long-lived process reconnecting in a loop, which is exactly the
+   thing being bounded. */
+#define CONN_ATTEMPT_WINDOW_SEC 10
+#define CONN_ATTEMPTS_PER_WINDOW 60
+#define ATTEMPT_SLOTS MAX_CONNS
+
+struct attempt_slot {
+  pid_t pid;
+  time_t window_start; /* CLOCK_MONOTONIC seconds */
+  unsigned count;
+  int used;
+};
+
+static struct attempt_slot attempt_slots[ATTEMPT_SLOTS];
+
+/* Record one connection attempt by `pid`. Returns 1 if it is within the
+   window budget, 0 if the pid is storming.
+
+   Counts EVERY attempt, including ones the caps below will refuse: a
+   client hammering a full connection table is the same storm as one
+   hammering an empty one, and the table cap alone would let it retry
+   forever at full speed. */
+static int attempt_admit(pid_t pid) {
+  time_t now = mono_secs();
+  struct attempt_slot *slot = NULL;
+
+  for (int i = 0; i < ATTEMPT_SLOTS; i++)
+    if (attempt_slots[i].used && attempt_slots[i].pid == pid) {
+      slot = &attempt_slots[i];
+      break;
+    }
+
+  if (!slot) {
+    for (int i = 0; i < ATTEMPT_SLOTS; i++)
+      if (!attempt_slots[i].used) {
+        slot = &attempt_slots[i];
+        break;
+      }
+  }
+  if (!slot) {
+    /* Full: reclaim the slot whose window is oldest. Unlike the rate
+       buckets this may steal from a live pid, and that is safe here
+       precisely because it is the direction that FORGIVES -- the victim
+       gets a fresh window, i.e. more budget, never less. A backstop that
+       could be made stricter by table pressure would refuse innocent
+       clients when a storm filled the table, which is the storm winning. */
+    slot = &attempt_slots[0];
+    for (int i = 1; i < ATTEMPT_SLOTS; i++)
+      if (attempt_slots[i].window_start < slot->window_start)
+        slot = &attempt_slots[i];
+    slot->used = 0;
+  }
+
+  if (!slot->used || slot->pid != pid ||
+      now - slot->window_start >= CONN_ATTEMPT_WINDOW_SEC) {
+    slot->used = 1;
+    slot->pid = pid;
+    slot->window_start = now;
+    slot->count = 0;
+  }
+
+  slot->count++;
+  return slot->count <= CONN_ATTEMPTS_PER_WINDOW;
 }
 
 /* ---- rate limiting (M4 step 10) -------------------------------------
@@ -3791,6 +3879,22 @@ int main(void) {
   printf("uictld: listening on %s\n", path);
   fflush(stdout);
 
+  /* WIRE.md §8.8. On stderr, not stdout, because that is what the
+     journal captures under Type=notify and because a restart is
+     diagnostic output rather than a result.
+
+     The pid is the point. A client's held state died with its
+     connection when this line was printed (§8.3), and the client has no
+     way to know that happened — §8.6's advice is the only thing that
+     even hints at it. When someone reports "my modifier got stuck" or
+     "my drag ended by itself", this line and its timestamp are what
+     turn that into "the daemon restarted at 14:02" instead of a hunt
+     through the compositor. */
+  fprintf(stderr,
+          "uictld: started (pid %d) — any client connected to a previous "
+          "instance has lost its held state and must re-HELLO\n",
+          (int)getpid());
+
   struct epoll_event events[8];
   int stop = 0;
 
@@ -3869,6 +3973,20 @@ int main(void) {
             audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0,
                       ERR_DENIED_BY_POLICY, "peer uid mismatch");
             deny_and_close(cfd, ERR_DENIED_BY_POLICY);
+            continue;
+          }
+
+          /* §8.7's backstop runs FIRST, before either cap, for two
+             reasons. It has to count attempts the caps would refuse
+             anyway: a client hammering a full table is the same storm as
+             one hammering an empty table, and if a cap answered first
+             the storm would never be recorded and could retry at full
+             speed forever. And it is the cheapest of the three checks,
+             so a storming peer costs one table scan rather than two. */
+          if (!attempt_admit(cred.pid)) {
+            audit_log(audit_fd, cred.pid, cred.uid, 0, OP_INVALID, 0, ERR_BUSY,
+                      "connection-attempt storm");
+            deny_and_close(cfd, ERR_BUSY);
             continue;
           }
 

@@ -272,6 +272,31 @@ static void usage(const char *prog) {
      offer. */
 }
 
+/* Exit codes — WIRE.md §8.8. Distinct, because "it did not work" is
+   three different situations for whoever is scripting this, and only one
+   of them is worth retrying:
+
+     1  usage or a local error. Nothing was sent and nothing will be.
+     2  the daemon could not be reached. Retryable — under socket
+        activation it may simply not be up yet.
+     3  the daemon answered and refused. The request reached the gate and
+        was rejected; `explain()` has already said which gate. Retrying
+        an identical request is only useful for the retryable result
+        classes, which proto.h enumerates.
+     4  reserved: the request was dropped without being sent, because a
+        reconnect invalidated it (§8.5). The one-shot CLI cannot produce
+        this — it never reconnects — but the code is claimed here so the
+        library and the CLI agree on the numbering rather than
+        discovering a conflict later.
+
+   0 remains success. The old behaviour was 1 for everything, which made
+   "uictld is not running" and "the deny-list refused that key"
+   indistinguishable to a caller. */
+#define EXIT_USAGE 1
+#define EXIT_UNREACHABLE 2
+#define EXIT_REFUSED 3
+#define EXIT_DROPPED 4 /* reserved; see above */
+
 static int open_socket(void) {
   const char *xdg = getenv("XDG_RUNTIME_DIR");
   if (!xdg) {
@@ -437,17 +462,17 @@ static int cmd_ping(int sfd) {
 
   if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0) {
     perror("uictl: write_full");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
   uint16_t result;
   if (read_response(sfd, OP_PING, req.seq, &result, NULL, 0, NULL) < 0) {
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   if (result != OK) {
     fprintf(stderr, "uictl: ping failed: %s\n", result_name(result));
     explain(result, 0);
-    return 1;
+    return EXIT_REFUSED;
   }
 
   if (write(STDOUT_FILENO, "PONG\n", 5) < 0) {
@@ -499,14 +524,14 @@ static int client_hello(int sfd, const char *name, int verbose,
   encode_frame_header(&req, req_hdr_buf);
   if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0) {
     fprintf(stderr, "uictl: write header\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   char payload_buf[sizeof(hello)];
   encode_hello(&hello, payload_buf);
   if (write_full(sfd, payload_buf, sizeof(payload_buf)) < 0) {
     fprintf(stderr, "uictl: write payload\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   /* Sized for the largest answer the daemon could legally send, not for
@@ -517,11 +542,11 @@ static int client_hello(int sfd, const char *name, int verbose,
   uint16_t result;
   if (read_response(sfd, OP_HELLO, req.seq, &result, data, sizeof(data),
                     &data_len) < 0)
-    return 1;
+    return EXIT_UNREACHABLE;
   if (result != OK) {
     fprintf(stderr, "uictl: hello failed: %s\n", result_name(result));
     explain(result, 0);
-    return 1;
+    return EXIT_REFUSED;
   }
   /* >=, never ==. Short is a broken daemon; long is a newer one, and
      ignoring the tail we don't understand is what makes adding a
@@ -618,23 +643,23 @@ static int cmd_key_tap(int sfd, int32_t code) {
   encode_frame_header(&req, req_hdr_buf);
   if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0) {
     fprintf(stderr, "uictl: write header\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
   char payload_buf[sizeof(key)];
   encode_key(&key, payload_buf);
   if (write_full(sfd, payload_buf, sizeof(payload_buf)) < 0) {
     fprintf(stderr, "uictl: write payload\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   uint16_t result;
   if (read_response(sfd, OP_KEY_TAP, req.seq, &result, NULL, 0, NULL) < 0)
-    return 1;
+    return EXIT_UNREACHABLE;
   if (result != OK) {
     fprintf(stderr, "uictl: key-tap %d failed: %s\n", code,
             result_name(result));
     explain(result, code);
-    return 1;
+    return EXIT_REFUSED;
   }
   printf("OK seq=%u code=%d\n", req.seq, code);
   return 0;
@@ -721,19 +746,19 @@ static int cmd_key_combo(int sfd, const int32_t *codes, int n) {
   if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0 ||
       write_full(sfd, payload, off) < 0) {
     fprintf(stderr, "uictl: write request\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   uint16_t result;
   if (read_response(sfd, OP_KEY_SEQUENCE, req.seq, &result, NULL, 0, NULL) < 0)
-    return 1;
+    return EXIT_UNREACHABLE;
   if (result != OK) {
     fprintf(stderr, "uictl: key-combo failed: %s\n", result_name(result));
     /* The keycode in the message is the first one; the daemon rejects on
        the first offending item, and for a 2-key combo that is nearly
        always the modifier or the key itself. */
     explain(result, codes[0]);
-    return 1;
+    return EXIT_REFUSED;
   }
   printf("OK seq=%u (%d keys)\n", req.seq, n);
   return 0;
@@ -757,15 +782,15 @@ static int simple_cmd(int sfd, uint16_t opcode, const char *label,
   if (write_full(sfd, hdr_buf, sizeof(hdr_buf)) < 0 ||
       (len && write_full(sfd, payload, len) < 0)) {
     fprintf(stderr, "uictl: write %s\n", label);
-    return 1;
+    return EXIT_UNREACHABLE;
   }
   uint16_t result;
   if (read_response(sfd, opcode, req.seq, &result, NULL, 0, NULL) < 0)
-    return 1;
+    return EXIT_UNREACHABLE;
   if (result != OK) {
     fprintf(stderr, "uictl: %s failed: %s\n", label, result_name(result));
     explain(result, detail);
-    return 1;
+    return EXIT_REFUSED;
   }
   printf("OK seq=%u\n", req.seq);
   return 0;
@@ -823,7 +848,7 @@ static int cmd_move_abs(int sfd, int32_t x, int32_t y) {
   encode_frame_header(&req, req_hdr_buf);
   if (write_full(sfd, req_hdr_buf, sizeof(req_hdr_buf)) < 0) {
     fprintf(stderr, "uictl: write header\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   char payload_buf[sizeof(mv)];
@@ -831,18 +856,18 @@ static int cmd_move_abs(int sfd, int32_t x, int32_t y) {
 
   if (write_full(sfd, payload_buf, sizeof(payload_buf)) < 0) {
     fprintf(stderr, "uictl: write payload\n");
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   uint16_t result;
   if (read_response(sfd, OP_MOVE_ABS, req.seq, &result, NULL, 0, NULL) < 0) {
-    return 1;
+    return EXIT_UNREACHABLE;
   }
 
   if (result != OK) {
     fprintf(stderr, "uictl: move-abs failed: %s\n", result_name(result));
     explain(result, 0);
-    return 1;
+    return EXIT_REFUSED;
   }
 
   printf("OK seq=%u\n", req.seq);
@@ -862,7 +887,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_ping(sfd);
     close(sfd);
     return rc;
@@ -875,7 +900,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = client_hello(sfd, argv[2], 1, NULL);
     close(sfd);
     return rc;
@@ -893,7 +918,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_key_tap(sfd, code);
     close(sfd);
     return rc;
@@ -918,7 +943,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_key_combo(sfd, codes, n);
     close(sfd);
     return rc;
@@ -936,7 +961,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_click(sfd, (uint16_t)code);
     close(sfd);
     return rc;
@@ -954,7 +979,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_move_rel(sfd, dx, dy);
     close(sfd);
     return rc;
@@ -973,7 +998,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_scroll(sfd, v, h);
     close(sfd);
     return rc;
@@ -995,7 +1020,7 @@ int main(int argc, char *argv[]) {
     }
     int sfd = open_socket();
     if (sfd < 0)
-      return 1;
+      return EXIT_UNREACHABLE;
     int rc = cmd_move_abs(sfd, x, y);
     close(sfd);
     return rc;

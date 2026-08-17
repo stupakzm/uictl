@@ -52,6 +52,7 @@ SUITES = [
     ("test_m5_confirm.py",       "own",    "confirmation: parked requests, fails closed, no source_tag"),
     ("test_m55_pointer.py",      "own",    "device split, buttons, rel/scroll, batch, audit coalescing"),
     ("test_wire831_forgive.py",  "own",    "WIRE.md 8.3.1: the first release on a connection is forgiven"),
+    ("test_wire87_storm.py",     "own",    "WIRE.md 8.7: the connection-attempt backstop"),
 ]
 
 # M4 step 11 named four cells; M4.5 added three more. Each maps to the
@@ -71,6 +72,7 @@ MATRIX = [
     ("batch all-or-nothing",    "test_m55_pointer.py"),
     ("audit volume (G10)",      "test_m55_pointer.py"),
     ("reconnect release (8.3.1)", "test_wire831_forgive.py"),
+    ("reconnect storm (8.7)",     "test_wire87_storm.py"),
 ]
 
 
