@@ -24,7 +24,7 @@ decisions but is checked by the compiler.
 | 3 | Handshake | *not yet written* |
 | 4 | Result codes and response classes | *not yet written* |
 | 5A | **Opcodes — the pointer** | **normative** |
-| 5B | Opcodes — the keyboard, and `BATCH` | *not yet written* |
+| 5B | **Opcodes — the keyboard, and `BATCH`** | **normative** |
 | 6 | **Held state** | **normative** |
 | 7 | Confirmation | *not yet written* |
 | 8 | **Connection lifecycle and restart** | **normative** |
@@ -297,6 +297,295 @@ If the connection drops anywhere in that sequence, §8 applies in full:
 the button is released by the daemon, the client's held set is empty,
 nothing is replayed, and the next connection starts with a fresh
 `HELLO`.
+
+---
+
+## 5B. The keyboard, and `BATCH`
+
+`KEY_TAP`, `KEY_SEQUENCE`, `KEY_DOWN` and `KEY_UP` write to the device
+named `uictl virtual keyboard`. `BATCH` is here because it spans both
+devices and cannot be specified until §5A and the rest of §5B are.
+
+### 5B.0 Two lists, and only one of them is negotiable
+
+Every keycode in §5B passes **both**. §5A's opcodes pass neither — the
+pointer is not governed by either list (§5A.0).
+
+**The deny-list** is static, compiled into the daemon's platform layer,
+and **configuration cannot unlock it**. It refuses with
+`ERR_KEY_DENYLISTED`, and the audit line names the category:
+
+| Category | What it covers |
+|---|---|
+| `power` | `KEY_POWER`, `KEY_POWER2` |
+| `suspend` | `KEY_SLEEP`, `KEY_SUSPEND` |
+| `restart`, `logoff` | `KEY_RESTART`, `KEY_LOGOFF` |
+| `sysrq` | `KEY_SYSRQ` — Alt+SysRq talks straight to the kernel |
+| `rfkill`, `radio` | `KEY_RFKILL`, `KEY_BLUETOOTH`, `KEY_WLAN`, `KEY_UWB` |
+| `eject` | `KEY_EJECTCD` … `KEY_EJECTCLOSECD` |
+| `brightness` | every brightness key |
+| `fn block` | `KEY_FN` … `KEY_FN_RIGHT_SHIFT` |
+| `braille block`, `numeric block` | unused surfaces, closed on principle |
+
+Two shapes of reason. Most are keys where **one keystroke ends the
+session or the machine**, and several of them take away the very thing
+an operator would use to stop the daemon — a radio key can disconnect
+the session you would SSH in over, and zero brightness is
+indistinguishable from a dead display while needing the screen you just
+turned off to recover. The braille and numeric blocks are different:
+nothing legitimate wants them, and an unused surface is worth closing.
+
+**The allowlist** is `~/.config/uictl/policy`, written by the user, one
+keycode or `lo-hi` range per line, `#` comments. It refuses with
+`ERR_KEY_NOT_ALLOWED`.
+
+**Strict default-deny: no policy file means no keys at all.** Not "all
+keys", not "safe keys". A fresh install injects nothing until its owner
+writes down what they want, and the daemon says so at startup. `uictl
+key-tap` doing nothing on a new machine is the allowlist working.
+
+The file must be mode `0600` and owned by the caller; anything looser is
+**ignored entirely**, which under default-deny means no keys — it fails
+safe. Both lists load once at startup, like the client registry, because
+policy that changes mid-session is policy nobody can audit afterwards.
+
+The two error codes are separate because they call for opposite
+responses. `ERR_KEY_NOT_ALLOWED` means *add a line to a file*.
+`ERR_KEY_DENYLISTED` means *this will never work, do something else*. A
+client that collapsed them could only print "denied", leaving the user
+to guess which of those two situations they are in — and sending someone
+to edit a config file that cannot help them is worse than saying no.
+
+If a policy file names a deny-listed code, the deny-list wins and
+startup warns that the entry is dead.
+
+### 5B.1 `KEY_TAP` — press and release, one frame
+
+```c
+struct uictl_payload_key {
+    uint16_t keycode;
+};                                  /* exactly 2 bytes */
+```
+
+Valid keycodes are `1 .. 767` (`KEY_MAX`); `0` and above the ceiling are
+`ERR_PAYLOAD_INVALID`. That is a *range* check, not policy — the type
+bounds what is expressible, the daemon bounds what is acceptable.
+
+Numeric keycodes only. A symbolic `KEY_A` table belongs in the client;
+keeping the wire numeric is honest about what it carries.
+
+Results: `OK`, `ERR_PAYLOAD_INVALID`, `ERR_KEY_DENYLISTED`,
+`ERR_KEY_NOT_ALLOWED`, `ERR_RATE_LIMITED`, `ERR_CONFIRM_*`,
+`ERR_INTERNAL`.
+
+A tap leaves nothing held, so §6 does not apply to it.
+
+### 5B.2 `KEY_SEQUENCE` — atomic, and self-balancing
+
+```c
+struct uictl_payload_key_seq {      /* header */
+    uint16_t count;                 /* 1 .. 16 */
+    uint16_t reserved;              /* MUST be zero */
+};
+struct uictl_seq_item {             /* × count */
+    uint16_t keycode;
+    uint8_t  value;                 /* 1 = press, 0 = release, nothing else */
+    uint8_t  reserved;              /* MUST be zero */
+};
+```
+
+`payload_len` is exactly `4 + 4 × count`. Both `reserved` fields are
+read and rejected rather than ignored, so a future field cannot collide
+with junk an old client happened to send.
+
+This is what modifier-plus-key needs. Ctrl+A is
+`down 29, down 30, up 30, up 29` — four transitions in **one request**,
+applied under a single `SYN_REPORT`. A client sending four separate
+requests could be interrupted between any two of them by another
+client's request, and would land Ctrl on someone else's keystroke.
+
+#### Self-balancing is the whole design
+
+**Every press must have its matching release inside the same request.**
+The daemon refuses a sequence that is not balanced.
+
+That constraint is why this opcode could ship while `KEY_DOWN`/`KEY_UP`
+were still blocked on the machinery in §6: a balanced request cannot
+leave a key held, so there is no orphaned kernel state for a dying
+client to strand. Refusing to create the possibility was cheaper than
+building the cleanup — and when the cleanup arrived, this opcode did not
+need it.
+
+Balance is tracked item by item, not counted at the end:
+
+- a press of a code the sequence already holds → `ERR_PAYLOAD_INVALID`
+- a release of a code the sequence does not hold → `ERR_PAYLOAD_INVALID`
+- anything still held after the last item → `ERR_PAYLOAD_INVALID`
+
+Checking as it goes rather than summing makes "balanced" a statement
+about each key's state rather than arithmetic that `down A, down A, up A,
+up A` would satisfy.
+
+#### Two passes, and the order of the errors is deliberate
+
+Pass 1 validates **structure and balance** for every item. Pass 2
+applies **policy** — deny-list, then allowlist — to every item. Only
+then is anything written.
+
+Structure before policy, so that an unbalanced request that *also* names
+an unlisted key reports the malformed sequence. Report the policy miss
+first and the user edits their policy file, retries, and meets the real
+error on the second attempt.
+
+Validate-everything-then-write is the same rule `BATCH` follows and for
+the same reason: a per-item check-then-write loop leaves a rejected
+item's predecessors already delivered, and when one of those was a press
+that is the stuck-key scenario arriving through the back door.
+
+#### Cost
+
+A sequence costs **one rate-limit unit per press**, not one per request.
+A 16-key combo is sixteen keystrokes; pricing it as one would make this
+opcode a way around the limit.
+
+Results: `OK`, `ERR_PAYLOAD_INVALID`, `ERR_KEY_DENYLISTED`,
+`ERR_KEY_NOT_ALLOWED`, `ERR_RATE_LIMITED`, `ERR_CONFIRM_*`,
+`ERR_INTERNAL`.
+
+### 5B.3 `KEY_DOWN` / `KEY_UP` — held keys
+
+Both take `struct uictl_payload_key`, 2 bytes — the question ("which
+key?") is the same as `KEY_TAP`'s.
+
+These are the opcodes §6 exists for. Everything there applies: the
+shared hold set, the cap of 16, one holder per code, release on every
+disconnect path, the 30-second dead-man timer, and §8.3.1's forgiving
+window. This section does not restate it.
+
+What belongs here is the split in what the two opcodes are allowed to
+refuse.
+
+`KEY_DOWN` runs the **full gate**, identical to `KEY_TAP`'s, plus
+arbitration: range → deny-list → allowlist → already-held → held-by-other
+→ hold cap → write → record.
+
+`KEY_UP` runs **almost nothing**: size, range, "do you hold it", write.
+No deny-list, no allowlist, no rate limit, **no confirmation** (§6.3).
+The reasoning is in §6.3 and the short version is that policy already
+had its say on the press, so re-asking on the way up can only ever
+create a stuck key.
+
+**A one-shot process should not use these.** The release fires when the
+connection closes, so `KEY_DOWN` from a program that then exits is an
+elaborate `KEY_TAP`. They exist for long-lived clients holding a code
+*across* other requests — which is exactly what `KEY_SEQUENCE`
+deliberately cannot express, since it must balance within one frame.
+
+`KEY_DOWN` results: `KEY_TAP`'s, plus `ERR_KEY_ALREADY_HELD`,
+`ERR_KEY_HELD_BY_OTHER`, `ERR_TOO_MANY_HELD`.
+`KEY_UP` results: `OK`, `ERR_PAYLOAD_INVALID`, `ERR_KEY_NOT_HELD`,
+`ERR_INTERNAL`.
+
+### 5B.4 `BATCH` — several sub-ops, atomic per device
+
+```c
+struct uictl_payload_batch {        /* header */
+    uint16_t count;                 /* 1 .. 16 */
+    uint16_t reserved;              /* MUST be zero */
+};
+struct uictl_batch_item {           /* × count, 12 bytes each */
+    uint16_t opcode;
+    uint16_t reserved;              /* MUST be zero */
+    int32_t  a;
+    int32_t  b;
+};
+```
+
+`payload_len` is exactly `4 + 12 × count`.
+
+The item is a fixed-size tagged union, so the whole batch validates in
+one pass with no pointer chasing. `a` and `b` mean whatever the sub-op
+means:
+
+| Sub-opcode | `a` | `b` |
+|---|---|---|
+| `MOVE_ABS` | `x` | `y` |
+| `MOVE_REL` | `dx` | `dy` |
+| `SCROLL` | `notches_v` | `notches_h` |
+| `BUTTON` | button code | `1` = down, `0` = up |
+| `KEY_DOWN` | keycode | unused |
+| `KEY_UP` | keycode | unused |
+
+**Exactly those six are batchable.** Anything else, including `KEY_TAP`,
+`KEY_SEQUENCE`, `PING`, `HELLO` and a nested `BATCH`, is
+`ERR_PAYLOAD_INVALID`. `KEY_TAP` and `KEY_SEQUENCE` are excluded because
+each is already an atomic multi-event request; nesting atomicity inside
+atomicity buys nothing and complicates the balance rules.
+
+#### "Atomic per device" is the subtlety
+
+An event frame is atomic **per device**, and nothing below the kernel
+joins two devices into one frame. Since the pointer and keyboard are
+separate virtual devices, a batch touching both lands as **two**
+`SYN_REPORT`s — pointer items in one, keyboard items in the other.
+
+A modifier plus a click is therefore two reports. That is not a
+limitation being apologised for: it is what the same gesture is on real
+hardware, where the modifier comes from a keyboard and the click from a
+mouse.
+
+A client that needs true single-frame atomicity must stay within one
+device — `KEY_SEQUENCE` for keys, or a batch of pointer-only items.
+
+#### All-or-nothing
+
+Pass 1 validates every item — structure, range, deny-list, allowlist,
+and the §6 hold rules against a *hypothetical* hold set that tracks what
+the batch would hold. Pass 2 writes. Nothing between them can fail on
+policy grounds.
+
+So a batch whose last item is invalid writes **nothing at all**, and the
+result names the offending item's index. There is no partial-failure
+story because there is no partial failure.
+
+The hold rules are checked against what the batch *would* hold, not only
+against what the connection already holds: a batch pressing the same
+code twice, or exceeding the cap of 16 partway through, is refused as a
+whole.
+
+A release inside a batch is **not** covered by §8.3.1's forgiving
+window. A batch is one unit the client composed, so a stray release
+inside it is a composition error rather than a reconnect artifact — and
+§8.5 forbids resending a batch across a reconnect anyway.
+
+#### One sharp edge
+
+A batch from a client with the `confirm` role can be **too large to
+prompt**. The parked-request buffer is 128 bytes and a full 16-item
+batch is 196, so it is refused with `ERR_TOO_LARGE` rather than
+truncated: a prompt describing less than what would execute is worse
+than no prompt. Flagged clients should keep batches to 10 items or send
+sub-ops individually.
+
+Results: `OK`, `ERR_PAYLOAD_INVALID`, `ERR_TOO_LARGE`, and every result
+its sub-ops can produce.
+
+### 5B.5 A worked client
+
+```
+connect(); HELLO                 mandatory (§3)
+  check the opcode_bitmap bits you intend to use
+KEY_TAP 30                       'a', if 30 is in the policy file
+KEY_SEQUENCE [29↓ 30↓ 30↑ 29↑]   Ctrl+A, one frame, balanced
+KEY_DOWN 42                      hold Shift...
+MOVE_REL 50 0                    ...across other requests
+KEY_UP 42                        release it — never refused for policy
+close()                          anything still held is released here
+```
+
+On a fresh machine every keyboard line above returns
+`ERR_KEY_NOT_ALLOWED` until `~/.config/uictl/policy` exists. That is
+§5B.0 working, not a fault.
 
 ---
 
