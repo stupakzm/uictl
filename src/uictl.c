@@ -52,6 +52,14 @@ static const char *result_name(uint16_t r) {
     return "you do not hold that keycode";
   case ERR_TOO_MANY_HELD:
     return "too many keys held at once";
+  case ERR_CONFIRM_UNAVAILABLE:
+    return "this client needs confirmation and no confirmer is running";
+  case ERR_CONFIRM_DENIED:
+    return "the user declined";
+  case ERR_CONFIRM_TIMEOUT:
+    return "nobody answered the confirmation prompt";
+  case ERR_NOT_CONFIRMER:
+    return "not allowed to act as the confirmer";
   default:
     return "unknown result code";
   }
@@ -188,6 +196,41 @@ static void explain(uint16_t result, long detail) {
             "        force-released it (a hold may not outlive 30s).\n",
             detail);
     break;
+  case ERR_CONFIRM_UNAVAILABLE:
+    fprintf(stderr,
+            "  why:  this client's name carries the `confirm` role, so its "
+            "requests\n"
+            "        wait for a human — and no confirmer is subscribed\n"
+            "  fix:  run `uictl-confirm NAME` in a terminal, where NAME has "
+            "the\n"
+            "        `confirmer` role in ~/.config/uictl/clients. it fails "
+            "closed on\n"
+            "        purpose: no prompter means no approval, not automatic "
+            "approval.\n");
+    break;
+  case ERR_CONFIRM_DENIED:
+    fprintf(stderr, "  why:  a human was asked and said no\n"
+                    "  fix:  none — asking again is asking twice. do "
+                    "something else.\n");
+    break;
+  case ERR_CONFIRM_TIMEOUT:
+    fprintf(stderr,
+            "  why:  the confirmation prompt went unanswered\n"
+            "  fix:  retry if you expect someone to be at the keyboard. a "
+            "timeout\n"
+            "        is always a denial, never a silent approval.\n");
+    break;
+  case ERR_NOT_CONFIRMER:
+    fprintf(stderr,
+            "  why:  only a client whose registry entry carries the "
+            "`confirmer`\n"
+            "        role may subscribe, and only one at a time\n"
+            "  fix:  add `NAME untrusted confirmer` to "
+            "~/.config/uictl/clients (mode\n"
+            "        0600) and restart uictld. `kill -USR1 $(pgrep -x "
+            "uictld)` shows\n"
+            "        whether one is already subscribed.\n");
+    break;
   case ERR_TOO_MANY_HELD:
     fprintf(stderr,
             "  why:  this connection is already holding the maximum number "
@@ -217,6 +260,16 @@ static void usage(const char *prog) {
   fprintf(stderr, "       %s key-tap CODE\n", prog);
   fprintf(stderr, "       %s key-combo CODE [CODE...]   (e.g. 29 30 = "
                   "Ctrl+A)\n", prog);
+  fprintf(stderr, "       %s click BUTTON             (272=left 273=right "
+                  "274=middle)\n", prog);
+  fprintf(stderr, "       %s move-rel DX DY           (device units, not "
+                  "pixels)\n", prog);
+  fprintf(stderr, "       %s scroll VERT [HORIZ]      (wheel notches, + is "
+                  "up/right)\n", prog);
+  /* No `button-down` / `button-up`, for the same reason there is no
+     `key-down`: this process exits, the connection closes, and the
+     daemon releases the hold. `click` is what a one-shot can honestly
+     offer. */
 }
 
 static int open_socket(void) {
@@ -509,7 +562,15 @@ static int client_hello(int sfd, const char *name, int verbose,
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP)) ? "key-tap " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_SEQUENCE)) ? "key-seq " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_DOWN)) ? "key-down " : "",
-         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_UP)) ? "key-up" : "");
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_UP)) ? "key-up " : "");
+  printf("             %s%s%s%s%s\n",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_BUTTON)) ? "button " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_MOVE_REL)) ? "move-rel " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_SCROLL)) ? "scroll " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_BATCH)) ? "batch " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_CONFIRM_SUBSCRIBE))
+             ? "confirm"
+             : "");
   return 0;
 }
 
@@ -678,6 +739,71 @@ static int cmd_key_combo(int sfd, const int32_t *codes, int n) {
   return 0;
 }
 
+/* One shape for every simple M5.5 command: handshake, send a fixed-size
+   payload, read one result. They differ only in opcode, payload and the
+   name in the error message, so they share a helper rather than being
+   four copies of cmd_move_abs with three words changed. */
+static int simple_cmd(int sfd, uint16_t opcode, const char *label,
+                      const void *payload, size_t len, long detail) {
+  if (client_hello(sfd, "uictl", 0, NULL) != 0)
+    return 1;
+  struct uictl_frame_header req = {.version = UICTL_PROTO_VERSION,
+                                   .opcode = opcode,
+                                   .source_tag = SRC_CLI,
+                                   .seq = 2, /* the handshake was seq 1 */
+                                   .payload_len = (uint32_t)len};
+  char hdr_buf[sizeof(struct uictl_frame_header)];
+  encode_frame_header(&req, hdr_buf);
+  if (write_full(sfd, hdr_buf, sizeof(hdr_buf)) < 0 ||
+      (len && write_full(sfd, payload, len) < 0)) {
+    fprintf(stderr, "uictl: write %s\n", label);
+    return 1;
+  }
+  uint16_t result;
+  if (read_response(sfd, opcode, req.seq, &result, NULL, 0, NULL) < 0)
+    return 1;
+  if (result != OK) {
+    fprintf(stderr, "uictl: %s failed: %s\n", label, result_name(result));
+    explain(result, detail);
+    return 1;
+  }
+  printf("OK seq=%u\n", req.seq);
+  return 0;
+}
+
+/* `uictl click BUTTON` presses and releases in one connection, because a
+   one-shot CLI cannot hold anything: the daemon releases everything a
+   connection holds the moment it closes (M4.5 task 2), so a bare
+   `button down` from a process that then exits is a click with extra
+   steps. Holding across requests is what long-lived clients use
+   OP_BUTTON's two halves for. Sent as a BATCH so the press and release
+   are validated together. */
+static int cmd_click(int sfd, uint16_t code) {
+  struct {
+    struct uictl_payload_batch h;
+    struct uictl_batch_item items[2];
+  } b;
+  memset(&b, 0, sizeof(b));
+  b.h.count = 2;
+  b.items[0].opcode = OP_BUTTON;
+  b.items[0].a = code;
+  b.items[0].b = 1;
+  b.items[1].opcode = OP_BUTTON;
+  b.items[1].a = code;
+  b.items[1].b = 0;
+  return simple_cmd(sfd, OP_BATCH, "click", &b, sizeof(b), code);
+}
+
+static int cmd_move_rel(int sfd, int32_t dx, int32_t dy) {
+  struct uictl_payload_move_rel mv = {.dx = dx, .dy = dy};
+  return simple_cmd(sfd, OP_MOVE_REL, "move-rel", &mv, sizeof(mv), 0);
+}
+
+static int cmd_scroll(int sfd, int32_t v, int32_t h) {
+  struct uictl_payload_scroll sc = {.notches_v = v, .notches_h = h};
+  return simple_cmd(sfd, OP_SCROLL, "scroll", &sc, sizeof(sc), 0);
+}
+
 static int cmd_move_abs(int sfd, int32_t x, int32_t y) {
   /* Not optional since task 7: MOVE_ABS before HELLO is refused with
      ERR_HANDSHAKE_REQUIRED. The name is what the daemon looks up in its
@@ -794,6 +920,61 @@ int main(int argc, char *argv[]) {
     if (sfd < 0)
       return 1;
     int rc = cmd_key_combo(sfd, codes, n);
+    close(sfd);
+    return rc;
+  }
+
+  if (strcmp(argv[1], "click") == 0) {
+    if (argc != 3) {
+      usage(argv[0]);
+      return 1;
+    }
+    int32_t code;
+    if (!parse_int32(argv[2], &code) || code < 0 || code > 0xffff) {
+      fprintf(stderr, "uictl: bad BUTTON\n");
+      return 1;
+    }
+    int sfd = open_socket();
+    if (sfd < 0)
+      return 1;
+    int rc = cmd_click(sfd, (uint16_t)code);
+    close(sfd);
+    return rc;
+  }
+
+  if (strcmp(argv[1], "move-rel") == 0) {
+    if (argc != 4) {
+      usage(argv[0]);
+      return 1;
+    }
+    int32_t dx, dy;
+    if (!parse_int32(argv[2], &dx) || !parse_int32(argv[3], &dy)) {
+      fprintf(stderr, "uictl: bad DX/DY\n");
+      return 1;
+    }
+    int sfd = open_socket();
+    if (sfd < 0)
+      return 1;
+    int rc = cmd_move_rel(sfd, dx, dy);
+    close(sfd);
+    return rc;
+  }
+
+  if (strcmp(argv[1], "scroll") == 0) {
+    if (argc != 3 && argc != 4) {
+      usage(argv[0]);
+      return 1;
+    }
+    int32_t v, h = 0;
+    if (!parse_int32(argv[2], &v) ||
+        (argc == 4 && !parse_int32(argv[3], &h))) {
+      fprintf(stderr, "uictl: bad notch count\n");
+      return 1;
+    }
+    int sfd = open_socket();
+    if (sfd < 0)
+      return 1;
+    int rc = cmd_scroll(sfd, v, h);
     close(sfd);
     return rc;
   }

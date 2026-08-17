@@ -4,7 +4,12 @@ override CFLAGS += -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
 	-fPIE -Wall -Wextra -Wconversion -g -std=c11 -D_GNU_SOURCE
 override LDFLAGS += -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 
-all: uictl uictld
+# Three binaries now, not two. The daemon and the CLI have different
+# threat profiles (plan.md), and uictl-confirm has a third: it is the
+# only client the daemon ever pushes to, and it is the piece a human
+# looks at. Same flags for all three -- a helper compiled without the
+# hardening block would be the soft target.
+all: uictl uictld uictl-confirm
 
 UICTLD_SRCS = src/uictld.c src/platform/uinput.c
 UICTLD_HDRS = src/proto.h src/platform/uinput.h
@@ -12,9 +17,12 @@ UICTLD_HDRS = src/proto.h src/platform/uinput.h
 uictl: src/uictl.c src/proto.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+uictl-confirm: src/uictl-confirm.c src/proto.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 uictld:	$(UICTLD_SRCS) $(UICTLD_HDRS)
 	$(CC) $(CFLAGS) $(UICTLD_SRCS) -o $@ $(LDFLAGS)
 
 .PHONY: all clean
 clean:
-	rm -f uictl uictld 
+	rm -f uictl uictld uictl-confirm

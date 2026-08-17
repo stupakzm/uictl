@@ -1,5 +1,6 @@
 uictl
 uictld
+uictl-confirm
 *.o
 *.md
 compile_flags.txt

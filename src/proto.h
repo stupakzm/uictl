@@ -66,7 +66,30 @@ enum uictl_op {
      — which is exactly what OP_KEY_SEQUENCE deliberately cannot
      express. */
   OP_KEY_DOWN,
-  OP_KEY_UP
+  OP_KEY_UP,
+
+  /* M5 — confirmation. Three opcodes for one flow, and one of them
+     breaks a rule the protocol has followed since M2: OP_CONFIRM_REQUEST
+     is sent by the *daemon*, unprompted, to the subscribed confirmer.
+     Every other frame in this protocol is a client request or the
+     response to one. A confirmer must therefore be written to read
+     frames it did not ask for; a normal client never sees one, because
+     the daemon only ever pushes on a connection that subscribed.
+
+     Why a subscribing client and not a subprocess: plan.md forbids the
+     daemon from ever fork()ing or exec()ing — that whole branch of
+     ydotool's attack surface stays closed — so the confirmer is a
+     separate, already-running, unprivileged binary that connects like
+     anyone else. */
+  OP_CONFIRM_SUBSCRIBE, /* client -> daemon: "I am the confirmer"      */
+  OP_CONFIRM_REQUEST,   /* daemon -> confirmer: "may this proceed?"    */
+  OP_CONFIRM_DECIDE,    /* confirmer -> daemon: the answer + token     */
+
+  /* M5.5 — the pointer stops being motion-only. */
+  OP_BUTTON,   /* press or release one BTN_*, held like a key     */
+  OP_MOVE_REL, /* relative nudge, dx/dy in device units           */
+  OP_SCROLL,   /* wheel notches, vertical and horizontal          */
+  OP_BATCH     /* N sub-ops, one SYN_REPORT per device            */
 };
 
 /* Result codes are ON THE WIRE. Append only — never insert, never
@@ -169,7 +192,32 @@ enum uictl_result {
      more than a handful of keys down, and the bound keeps the
      synthesized release burst on disconnect small and predictable.
      Fixable by the client releasing what it holds. */
-  ERR_TOO_MANY_HELD
+  ERR_TOO_MANY_HELD,
+
+  /* M5 — confirmation. Kept apart from ERR_DENIED_BY_POLICY because
+     "the user said no" and "the rules say no" are different events: one
+     is a decision that could go the other way next time, the other is a
+     property of the configuration.
+
+       ERR_CONFIRM_UNAVAILABLE — this client's requests need a human, and
+                                 no confirmer is connected. Fixable: run
+                                 uictl-confirm. Fails CLOSED, which is
+                                 the whole point — a confirmation gate
+                                 that opens when the prompter is missing
+                                 is not a gate.
+       ERR_CONFIRM_DENIED      — a human saw it and said no. Terminal for
+                                 this request; retrying is asking twice.
+       ERR_CONFIRM_TIMEOUT     — nobody answered in time. Retryable, but
+                                 the client should assume the user is not
+                                 at the keyboard.
+       ERR_NOT_CONFIRMER       — OP_CONFIRM_SUBSCRIBE from a client whose
+                                 registry entry does not carry the
+                                 `confirmer` role, or a second subscriber
+                                 while one is already live. */
+  ERR_CONFIRM_UNAVAILABLE,
+  ERR_CONFIRM_DENIED,
+  ERR_CONFIRM_TIMEOUT,
+  ERR_NOT_CONFIRMER
 };
 
 /* ---- source_tag: ADVISORY METADATA ONLY (M3.6 task 6) ---------------
@@ -334,6 +382,142 @@ static inline size_t uictl_seq_payload_len(uint16_t count) {
   return sizeof(struct uictl_payload_key_seq) +
          (size_t)count * sizeof(struct uictl_seq_item);
 }
+
+/* ---- the coordinate contract (M5.5 task 5) --------------------------
+   **MOVE_ABS coordinates are device units, 0..abs_range_max, and the
+   CLIENT converts.** Not pixels, not a fraction, not "whatever your
+   screen is". The daemon reports `abs_range_max` in the HELLO response
+   and clamps to it; everything above that is the client's business.
+
+   The alternative was seriously considered and rejected: the daemon
+   could learn the output geometry and accept pixels. That requires
+   talking to the compositor, which drags a Wayland dependency into the
+   single most security-sensitive binary in the stack and violates
+   plan.md's "no $DISPLAY lookup, no X11 reach-out". The daemon's
+   ignorance of the display server is a feature worth more than the
+   convenience.
+
+   So the conversion — pixels to device units, across a multi-monitor
+   layout the client already knows about — lives in the client, where the
+   layout information already is. A future OP_MOVE_ABS_FRAME carrying
+   {x, y, frame_w, frame_h} could let the daemon scale without knowing
+   anything about displays, if it turns out every client writes the same
+   three lines. It is not needed yet.
+
+   REL_* deltas are device units too, and are NOT scaled by anything: a
+   relative nudge means the same thing on any screen, which is precisely
+   why muvor's nudge loop wants them.
+
+   Scroll is in NOTCHES — one detent of a physical wheel, positive is up
+   / right. The daemon emits both the classic notch and the hi-res value
+   the kernel expects alongside it; a client never has to know that. */
+
+struct uictl_payload_button {
+  uint16_t code;  /* BTN_LEFT etc. — the daemon validates it is one */
+  uint8_t down;   /* 1 = press, 0 = release */
+  uint8_t reserved; /* MUST be zero */
+};
+
+struct uictl_payload_move_rel {
+  int32_t dx;
+  int32_t dy;
+};
+
+struct uictl_payload_scroll {
+  int32_t notches_v; /* + = up   */
+  int32_t notches_h; /* + = right */
+};
+
+_Static_assert(sizeof(struct uictl_payload_button) == 4,
+               "button payload must be exactly 4 bytes");
+_Static_assert(sizeof(struct uictl_payload_move_rel) == 8,
+               "move_rel payload must be exactly 8 bytes");
+_Static_assert(sizeof(struct uictl_payload_scroll) == 8,
+               "scroll payload must be exactly 8 bytes");
+
+/* ---- OP_BATCH (M5.5 task 6) -----------------------------------------
+   N sub-ops applied under a single SYN_REPORT **per device**. The
+   per-device qualifier is the whole subtlety: with the pointer and
+   keyboard split into two virtual devices (task 4), a batch that touches
+   both cannot be one atomic report, because an event frame is atomic
+   per device and nothing below the kernel joins them. A modifier plus a
+   click therefore lands as two reports — exactly as it does on real
+   hardware, where the modifier comes from a keyboard and the click from
+   a mouse.
+
+   Open question 1 in plan-multiclient.md asked whether a batch needs a
+   partial-failure story. It does not, because it has none: **every
+   sub-op is validated before any is written**, the same all-or-nothing
+   rule OP_KEY_SEQUENCE follows, and for the same reason — a rejected
+   sub-op halfway through would leave the earlier presses delivered,
+   which is the stuck-key scenario arriving through the back door.
+
+   Layout: {u16 count, u16 reserved} then `count` × uictl_batch_item.
+   Each item is a tagged union of the sub-op payloads, fixed size so the
+   whole batch can be validated with one pass and no pointer chasing. */
+#define UICTL_BATCH_MAX 16
+
+struct uictl_batch_item {
+  uint16_t opcode;   /* OP_MOVE_ABS | OP_MOVE_REL | OP_SCROLL | OP_BUTTON
+                        | OP_KEY_DOWN | OP_KEY_UP */
+  uint16_t reserved; /* MUST be zero */
+  int32_t a;         /* x  | dx | notches_v | keycode/button | keycode */
+  int32_t b;         /* y  | dy | notches_h | down flag      | unused  */
+};
+
+struct uictl_payload_batch {
+  uint16_t count;
+  uint16_t reserved;
+};
+
+_Static_assert(sizeof(struct uictl_batch_item) == 12,
+               "batch item must be exactly 12 bytes");
+_Static_assert(sizeof(struct uictl_payload_batch) == 4,
+               "batch header must be exactly 4 bytes");
+
+static inline size_t uictl_batch_payload_len(uint16_t count) {
+  return sizeof(struct uictl_payload_batch) +
+         (size_t)count * sizeof(struct uictl_batch_item);
+}
+
+/* ---- confirmation payloads (M5) -------------------------------------
+   OP_CONFIRM_SUBSCRIBE carries no payload: the request *is* the whole
+   message, and who may send it is decided from the registry, not from
+   anything in the frame.
+
+   OP_CONFIRM_REQUEST is what the human is shown, so every field here is
+   something a person needs in order to answer. It deliberately does NOT
+   carry the raw payload of the request being confirmed: security rule 5
+   says the audit log records intent rather than content, and a
+   confirmation prompt is a second place the same rule applies. The
+   keycode is the exception, because "may this client press F13" is not
+   answerable without it.
+
+   `token` is the daemon's handle on the parked request. The confirmer
+   echoes it back; a decision carrying a stale token is dropped, which is
+   what stops a slow "yes" from approving whatever came after the request
+   it was meant for. */
+struct uictl_payload_confirm_req {
+  uint32_t token;
+  uint32_t peer_pid;  /* SO_PEERCRED, unforgeable */
+  uint16_t opcode;    /* what is being asked for */
+  uint16_t keycode;   /* the key/button, or 0 where not applicable */
+  uint16_t cl;        /* daemon-derived class, never source_tag */
+  uint16_t reserved;  /* MUST be zero */
+  char client_name[UICTL_CLIENT_NAME_MAX]; /* what it said at HELLO */
+};
+
+struct uictl_payload_confirm_decide {
+  uint32_t token;
+  uint8_t allow;      /* 1 = proceed, anything else = refuse */
+  uint8_t reserved[3]; /* MUST be zero */
+};
+
+_Static_assert(sizeof(struct uictl_payload_confirm_req) == 16 +
+                                                  UICTL_CLIENT_NAME_MAX,
+               "confirm request payload must be 16 + name");
+_Static_assert(sizeof(struct uictl_payload_confirm_decide) == 8,
+               "confirm decision payload must be exactly 8 bytes");
 
 /* What the daemon can do, answered in the HELLO response (M3.6 task 3).
    Capability bits describe the *device*, opcode bits describe the

@@ -43,6 +43,20 @@ static const char *opname(uint16_t op) {
     return "KEY_DOWN";
   case OP_KEY_UP:
     return "KEY_UP";
+  case OP_CONFIRM_SUBSCRIBE:
+    return "CONFIRM_SUBSCRIBE";
+  case OP_CONFIRM_REQUEST:
+    return "CONFIRM_REQUEST";
+  case OP_CONFIRM_DECIDE:
+    return "CONFIRM_DECIDE";
+  case OP_BUTTON:
+    return "BUTTON";
+  case OP_MOVE_REL:
+    return "MOVE_REL";
+  case OP_SCROLL:
+    return "SCROLL";
+  case OP_BATCH:
+    return "BATCH";
   default:
     return "UNKNOWN";
   }
@@ -167,9 +181,25 @@ static int class_from_word(const char *word, enum client_class *out) {
 #define MAX_REGISTERED_CLIENTS 16
 #define REGISTRY_MAX_BYTES 4096
 
+/* Roles are orthogonal to class, and deliberately so (M5). Class answers
+   "how fast may this client go"; a role answers "what is this client
+   *for*". The LLM agent is untrusted AND needs a human in the loop; a
+   confirmer needs no rate tier at all. Folding them into one enum would
+   have produced classes like `untrusted-confirm` that multiply with
+   every future axis.
+
+   ROLE_CONFIRM   this client's device requests are parked until a human
+                  approves them.
+   ROLE_CONFIRMER this client may answer those prompts. Config-gated on
+                  purpose: without it, any client could subscribe and
+                  approve its own requests. */
+#define ROLE_CONFIRM (1u << 0)
+#define ROLE_CONFIRMER (1u << 1)
+
 struct client_reg {
   char name[UICTL_CLIENT_NAME_MAX];
   enum client_class cl;
+  unsigned roles;
 };
 
 static struct client_reg registry[MAX_REGISTERED_CLIENTS];
@@ -281,14 +311,40 @@ static void load_client_registry(void) {
     }
     if (!word || class_from_word(word, &entry.cl) < 0) {
       fprintf(stderr,
-              "uictld: client registry line %d: expected 'NAME CLASS' with "
-              "CLASS one of untrusted|standard|interactive\n",
+              "uictld: client registry line %d: expected 'NAME CLASS "
+              "[ROLE...]' with CLASS one of untrusted|standard|interactive\n",
               line_no);
       continue;
     }
+
+    /* Trailing role words (M5). An unrecognised one is reported and the
+       line is dropped rather than accepted-minus-the-role: a typo'd
+       `confrim` would otherwise leave the agent running ungated, which
+       is exactly the silent weakening this project keeps refusing. */
+    int role_ok = 1;
+    for (const char *r = strtok_r(NULL, " \t\r", &fsave); r;
+         r = strtok_r(NULL, " \t\r", &fsave)) {
+      if (strcmp(r, "confirm") == 0)
+        entry.roles |= ROLE_CONFIRM;
+      else if (strcmp(r, "confirmer") == 0)
+        entry.roles |= ROLE_CONFIRMER;
+      else {
+        fprintf(stderr,
+                "uictld: client registry line %d: unknown role '%s' "
+                "(expected confirm|confirmer) — dropping the whole entry\n",
+                line_no, r);
+        role_ok = 0;
+        break;
+      }
+    }
+    if (!role_ok)
+      continue;
+
     registry[registry_len++] = entry;
-    fprintf(stderr, "uictld: client '%s' registered as '%s'\n", entry.name,
-            class_name(entry.cl));
+    fprintf(stderr, "uictld: client '%s' registered as '%s'%s%s\n", entry.name,
+            class_name(entry.cl),
+            (entry.roles & ROLE_CONFIRM) ? " +confirm" : "",
+            (entry.roles & ROLE_CONFIRMER) ? " +confirmer" : "");
   }
 }
 
@@ -473,6 +529,25 @@ static enum client_class class_for_name(const char *name) {
   return CLASS_UNTRUSTED;
 }
 
+/* Roles are opt-in per registry entry, so an unregistered client gets
+   none. Note which direction that fails in: an unknown client is NOT
+   asked for confirmation.
+
+   That is the opposite of the allowlist's default-deny, and it is a
+   considered trade rather than an oversight. Requiring confirmation for
+   every unregistered client would mean the CLI — and every test — needs
+   a confirmer running before a single key can be pressed, and a control
+   that everyone has to switch off to get work done is a control nobody
+   has. What actually bounds an unknown client is the deny-list, the
+   allowlist and its 5/s floor; confirmation is a speed bump for a
+   *named* client that the user has decided needs one. */
+static unsigned roles_for_name(const char *name) {
+  for (int i = 0; i < registry_len; i++)
+    if (strcmp(registry[i].name, name) == 0)
+      return registry[i].roles;
+  return 0;
+}
+
 static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
                       uint16_t op, uint32_t seq, uint16_t result,
                       const char *args) {
@@ -558,6 +633,25 @@ enum conn_phase { CONN_WANT_HEADER, CONN_WANT_PAYLOAD };
    the input broker itself as the wedged component. */
 #define MAX_HELD_PER_CONN 16
 #define HOLD_MAX_SEC 30
+
+/* ---- confirmation (M5) ----------------------------------------------
+   The largest request that can be parked awaiting a human. Every
+   confirmable opcode's payload fits: KEY_* is 2 bytes, MOVE_ABS 8, and
+   a full 16-item KEY_SEQUENCE is 68. Anything larger is refused rather
+   than truncated — a prompt that describes less than what would execute
+   is worse than no prompt.
+
+   One pending confirmation daemon-wide, not a queue. Confirmations run
+   at human speed; a queue of prompts is a worse experience than a
+   refusal, and it would also let one client fill the daemon's memory
+   with parked requests. A second confirmable request while one is
+   pending gets ERR_BUSY, which is already the "no room, try again" code.
+
+   30 seconds to answer, after which the request is denied. A timeout
+   that approved would be a confirmation gate that opens when nobody is
+   watching. */
+#define CONFIRM_MAX_PAYLOAD 128
+#define CONFIRM_TIMEOUT_SEC 30
 
 /* ---- epoll event keys ------------------------------------------------
    `epoll_event.data` is a union and the obvious choice, `.fd`, is a trap
@@ -678,6 +772,29 @@ struct conn {
   unsigned char held_bits[HELD_BITS_BYTES];
   int held_count;
   time_t held_since;
+
+  /* --- confirmation (M5) --------------------------------------------
+     `roles` is derived at HELLO from the local registry, exactly like
+     `cl`, and for the same reason: the client says a name, the daemon
+     decides what that name means.
+
+     A parked request is one the daemon has accepted, charged and
+     validated as far as policy, and is now holding while a human is
+     asked. It is stored as a copy rather than left in c->buf, because
+     conn_readable wipes that buffer after every dispatch (security rule
+     6) — and because a connection with a parked request stops reading,
+     so there is exactly one. */
+  unsigned roles;
+  int is_confirmer;
+  int awaiting_confirm;
+  /* Set by the OP_CONFIRM_DECIDE handler, consumed once by conn_readable
+     after that reply is staged: +1 allow, -1 deny, 0 nothing pending.
+     Deferred rather than applied inline because the decision acts on a
+     *different* connection, and doing that mid-dispatch would stage two
+     replies through one code path. */
+  int confirm_verdict;
+  struct uictl_frame_header parked_hdr;
+  char parked_payload[CONFIRM_MAX_PAYLOAD];
 };
 
 static struct conn conns[MAX_CONNS];
@@ -687,6 +804,106 @@ static time_t mono_secs(void) {
   if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
     return 0;
   return ts.tv_sec;
+}
+
+/* ---- motion audit coalescing (G10, forced by M5.5) -------------------
+   Every request has had its own audit line since M2, which was right
+   while every request was a discrete act. M5.5 makes pointer motion
+   real: muvor streams 30-60 nudges a second while a key is held, and one
+   line each is roughly 450 MB a day from that client alone. A log nobody
+   can keep is a log nobody reads.
+
+   Security rule 5 is the guide here, not an obstacle. It says the audit
+   records *intent*, and the intent behind 47 nudges in a second is "this
+   client moved the pointer" — one line saying so, with the count and
+   where it ended up, carries more of that than 47 lines each carrying a
+   pixel. So successful motion is accumulated per (pid, opcode) and
+   flushed once a second by the reaper.
+
+   What is NOT coalesced, deliberately:
+     - anything that failed. Refusals are rare, individually meaningful,
+       and exactly what someone greps for.
+     - keys, buttons, sequences and batches. Those are discrete acts
+       whose count is the point.
+   So the property that matters — every keystroke and every click has its
+   own line, forever — is untouched. */
+#define MOTION_ACC_SLOTS 8
+#define MOTION_FLUSH_SEC 1
+
+struct motion_acc {
+  int used;
+  pid_t pid;
+  uid_t uid;
+  uint32_t src; /* last source_tag seen, advisory as always */
+  uint16_t op;
+  uint32_t count;
+  int32_t last_a, last_b;
+  time_t since;
+};
+
+static struct motion_acc motion_accs[MOTION_ACC_SLOTS];
+
+static int op_is_motion(uint16_t op) {
+  return op == OP_MOVE_ABS || op == OP_MOVE_REL || op == OP_SCROLL;
+}
+
+static void motion_emit(int audit_fd, struct motion_acc *m, time_t now) {
+  if (!m || !m->used)
+    return;
+  char args[128];
+  snprintf(args, sizeof(args), "coalesced n=%u over %llds, last a=%d b=%d",
+           m->count, (long long)(now - m->since), m->last_a, m->last_b);
+  audit_log(audit_fd, m->pid, m->uid, m->src, m->op, 0, OK, args);
+  m->used = 0;
+}
+
+static void motion_note(int audit_fd, pid_t pid, uid_t uid, uint32_t src,
+                        uint16_t op, int32_t a, int32_t b) {
+  time_t now = mono_secs();
+  struct motion_acc *free_slot = NULL, *oldest = NULL;
+  for (int i = 0; i < MOTION_ACC_SLOTS; i++) {
+    struct motion_acc *m = &motion_accs[i];
+    if (m->used && m->pid == pid && m->op == op) {
+      m->count++;
+      m->last_a = a;
+      m->last_b = b;
+      m->src = src;
+      return;
+    }
+    if (!m->used && !free_slot)
+      free_slot = m;
+    if (m->used && (!oldest || m->since < oldest->since))
+      oldest = m;
+  }
+  if (!free_slot) {
+    /* More than 8 (pid, opcode) motion streams at once. Flush the oldest
+       to make room rather than dropping the new one: nothing is silently
+       discarded either way, and the stream that has been running longest
+       is the one whose line is most complete. */
+    motion_emit(audit_fd, oldest, now);
+    free_slot = oldest;
+  }
+  free_slot->used = 1;
+  free_slot->pid = pid;
+  free_slot->uid = uid;
+  free_slot->src = src;
+  free_slot->op = op;
+  free_slot->count = 1;
+  free_slot->last_a = a;
+  free_slot->last_b = b;
+  free_slot->since = now;
+}
+
+/* Flush anything older than MOTION_FLUSH_SEC, or everything if forced
+   (shutdown). Called from the reaper tick, so the coarse 1 s deadline is
+   really 1-2 s — same as every other deadline in this daemon. */
+static void motion_flush(int audit_fd, int force) {
+  time_t now = mono_secs();
+  for (int i = 0; i < MOTION_ACC_SLOTS; i++) {
+    struct motion_acc *m = &motion_accs[i];
+    if (m->used && (force || now - m->since >= MOTION_FLUSH_SEC))
+      motion_emit(audit_fd, m, now);
+  }
 }
 
 static void conn_table_init(void) {
@@ -739,6 +956,14 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     memset(c->held_bits, 0, sizeof(c->held_bits));
     c->held_count = 0;
     c->held_since = 0;
+    /* A reused slot must not inherit the previous peer's role: the
+       confirmer flag in particular would let an unrelated client answer
+       prompts simply by landing on the right index. */
+    c->roles = 0;
+    c->is_confirmer = 0;
+    c->awaiting_confirm = 0;
+    c->confirm_verdict = 0;
+    memset(c->parked_payload, 0, sizeof(c->parked_payload));
     return c;
   }
   return NULL; /* table full — caller refuses the connection */
@@ -830,7 +1055,8 @@ static void conn_hold_drop(struct conn *c, uint16_t code) {
    is a state no real keyboard produces.
 
    Returns the number of codes that could not be written. */
-static int conn_release_held(struct conn *c, int uinput_fd, int audit_fd,
+static int conn_release_held(struct conn *c, const struct uinput_devs *devs,
+                          int audit_fd,
                              const char *why) {
   if (c->held_count == 0)
     return 0; /* the overwhelming majority of closes: no work, no audit */
@@ -860,16 +1086,28 @@ static int conn_release_held(struct conn *c, int uinput_fd, int audit_fd,
       }
     }
 
+    /* M5.5: a held BUTTON lives on the pointer device, a held key on the
+       keyboard, and releasing one through the other writes an event the
+       kernel silently drops — a stuck button that the release path
+       *thinks* it released, which is worse than never having tried.
+       Buttons go out one at a time; there are five of them, and batching
+       across a device boundary is what this is avoiding. */
+    if (uinput_is_button((uint16_t)code)) {
+      if (uinput_button(devs->pointer, (uint16_t)code, 0) < 0)
+        failed++;
+      continue;
+    }
+
     batch[n].code = (uint16_t)code;
     batch[n].value = 0;
     n++;
     if (n == UINPUT_SEQ_MAX_EVENTS) {
-      if (uinput_key_seq(uinput_fd, batch, n) < 0)
+      if (uinput_key_seq(devs->keyboard, batch, n) < 0)
         failed += (int)n;
       n = 0;
     }
   }
-  if (n > 0 && uinput_key_seq(uinput_fd, batch, n) < 0)
+  if (n > 0 && uinput_key_seq(devs->keyboard, batch, n) < 0)
     failed += (int)n;
 
   /* Cleared through the one writer, after the writes and regardless of
@@ -1161,19 +1399,36 @@ static struct conn *conn_from_evkey(uint64_t key) {
   return c;
 }
 
-/* uinput_fd and audit_fd are threaded in rather than kept at file scope
+/* Forward declaration for one genuine cycle (M5): closing a connection
+   can resolve a pending confirmation, resolving one can complete a
+   parked request, and completing a request can close the connection it
+   came from. The alternative is moving the confirmation block above this
+   function, where it would sit above the reply helpers it needs — the
+   cycle is real, so name it here rather than shuffle definitions until
+   it hides. */
+static void confirm_on_conn_closed(int epfd, struct conn *gone, const struct uinput_devs *devs,
+                                   int audit_fd);
+
+/* devs and audit_fd are threaded in rather than kept at file scope
    precisely so this is not easy to forget: a new close path does not
    compile until its author has said where the releases go. That is worth
    more than the noise, because a close path that skips the release is
    invisible at runtime until the day a client dies holding Ctrl. */
-static void conn_close(int epfd, struct conn *c, int uinput_fd, int audit_fd) {
+static void conn_close(int epfd, struct conn *c, const struct uinput_devs *devs,
+                          int audit_fd) {
   if (!c || c->fd < 0)
     return;
 
   /* Before the fd goes away, and before the epoll deregistration — the
      order does not matter to the kernel device, but doing it first means
      no early return can ever be added above it. */
-  conn_release_held(c, uinput_fd, audit_fd, "connection closed");
+  conn_release_held(c, devs, audit_fd, "connection closed");
+
+  /* M5: if this was the confirmer, whoever is waiting on it must be told
+     now rather than left parked until the timeout — the prompter
+     vanishing is not consent. If instead this is the parked requester,
+     the pending confirmation is simply dropped. */
+  confirm_on_conn_closed(epfd, c, devs, audit_fd);
 
   epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
   close(c->fd);
@@ -1199,6 +1454,10 @@ static void conn_close(int epfd, struct conn *c, int uinput_fd, int audit_fd) {
   memset(c->held_bits, 0, sizeof(c->held_bits));
   c->held_count = 0;
   c->held_since = 0;
+  c->is_confirmer = 0;
+  c->awaiting_confirm = 0;
+  c->confirm_verdict = 0;
+  explicit_bzero(c->parked_payload, sizeof(c->parked_payload));
 }
 
 /* Best-effort refusal for a peer that never becomes a conn (bad uid,
@@ -1298,8 +1557,19 @@ static int conn_flush(struct conn *c) {
    - Conversely, arming EPOLLOUT when nothing is queued is the classic
      busy-loop: a writable socket is almost always writable. */
 static int conn_update_events(int epfd, struct conn *c) {
-  uint32_t want = (c->out_sent < c->out_len) ? (uint32_t)EPOLLOUT
-                                             : (uint32_t)EPOLLIN;
+  /* Three states, not two, since M5. A connection whose request is
+     parked awaiting a human wants NEITHER: not EPOLLOUT (there is no
+     reply to send yet) and not EPOLLIN (the next frame must not be
+     parsed, because answering it would jump the queue ahead of the
+     request the user is still looking at — and because this connection
+     has exactly one parked slot). 0 is a legal epoll mask: the fd stays
+     registered, EPOLLHUP/EPOLLERR still arrive, and the confirmation
+     path re-arms it. */
+  uint32_t want;
+  if (c->awaiting_confirm)
+    want = 0;
+  else
+    want = (c->out_sent < c->out_len) ? (uint32_t)EPOLLOUT : (uint32_t)EPOLLIN;
   if (want == c->events)
     return 0; /* nothing to do; skip the syscall */
   /* MOD replaces `data` as well as `events`, so the key must be rebuilt
@@ -1318,39 +1588,40 @@ static int conn_update_events(int epfd, struct conn *c) {
    Returns 0 if the connection survives and may keep parsing, -1 if it
    was closed. */
 static int conn_after_flush(int epfd, struct conn *c, int flushed,
-                            int uinput_fd, int audit_fd) {
+                            const struct uinput_devs *devs,
+                          int audit_fd) {
   if (flushed < 0) { /* dead socket */
-    conn_close(epfd, c, uinput_fd, audit_fd);
+    conn_close(epfd, c, devs, audit_fd);
     return -1;
   }
   if (flushed > 0) { /* still queued: wait for EPOLLOUT */
     if (c->out_since == 0)
       c->out_since = mono_secs(); /* start the stall clock */
     if (conn_update_events(epfd, c) < 0) {
-      conn_close(epfd, c, uinput_fd, audit_fd);
+      conn_close(epfd, c, devs, audit_fd);
       return -1;
     }
     return -1; /* survives, but the caller must stop reading */
   }
   if (c->close_after_flush) { /* fatal frame, reply delivered */
-    conn_close(epfd, c, uinput_fd, audit_fd);
+    conn_close(epfd, c, devs, audit_fd);
     return -1;
   }
   return 0;
 }
 
 /* The peer drained enough of its receive buffer for us to continue. */
-static void conn_writable(int epfd, struct conn *c, int uinput_fd,
+static void conn_writable(int epfd, struct conn *c, const struct uinput_devs *devs,
                           int audit_fd) {
   int flushed = conn_flush(c);
   if (flushed < 0) {
-    conn_close(epfd, c, uinput_fd, audit_fd);
+    conn_close(epfd, c, devs, audit_fd);
     return;
   }
   if (flushed > 0)
     return; /* still not drained; EPOLLOUT stays armed */
   if (c->close_after_flush) {
-    conn_close(epfd, c, uinput_fd, audit_fd);
+    conn_close(epfd, c, devs, audit_fd);
     return;
   }
   /* Re-arm EPOLLIN. We do NOT call conn_readable here: if the peer
@@ -1359,7 +1630,194 @@ static void conn_writable(int epfd, struct conn *c, int uinput_fd,
      EPOLLIN on the very next epoll_wait. Letting the loop do it keeps
      this function from recursing into the parser. */
   if (conn_update_events(epfd, c) < 0)
-    conn_close(epfd, c, uinput_fd, audit_fd);
+    conn_close(epfd, c, devs, audit_fd);
+}
+
+/* ---- confirmation (M5) ----------------------------------------------
+   One pending confirmation daemon-wide. The requester's connection is
+   parked (see conn_update_events) and the prompt is pushed to whichever
+   connection holds the confirmer role.
+
+   The token is what makes a slow "yes" safe. A confirmer that answers
+   after the request timed out — or after the requester disconnected and
+   the slot was reused — echoes a token that no longer matches, and the
+   decision is dropped. Without it, "the user approved something" and
+   "the user approved THIS" would be the same statement.
+
+   The requester is identified by slot + generation, never by pointer:
+   the same reasoning as the epoll event keys, and the same hazard. A
+   pointer would still be valid memory after the connection closed and
+   the slot was handed to someone else — and that someone else would
+   inherit an approval meant for a different client. */
+static struct {
+  int active;
+  uint32_t token;
+  int slot;        /* requester: conns[] index ... */
+  uint32_t gen;    /* ... and the generation it had when parked */
+  time_t since;    /* CLOCK_MONOTONIC seconds, for the timeout */
+  uint16_t opcode; /* what was asked, for the audit line */
+} pending_confirm;
+
+/* Never 0: 0 is the "no token" value a zeroed struct or a lazy client
+   would produce, and it must never match a live confirmation. */
+static uint32_t confirm_token_next = 1;
+
+static struct conn *confirm_requester(void) {
+  if (!pending_confirm.active)
+    return NULL;
+  struct conn *c = &conns[pending_confirm.slot];
+  if (c->fd < 0 || c->generation != pending_confirm.gen)
+    return NULL; /* the requester went away */
+  return c;
+}
+
+static struct conn *confirmer_conn(void) {
+  for (int i = 0; i < MAX_CONNS; i++)
+    if (conns[i].fd >= 0 && conns[i].is_confirmer)
+      return &conns[i];
+  return NULL;
+}
+
+/* Does this opcode reach the device? That is the whole test for "must a
+   human see it": the confirmation gate exists to put a person between a
+   flagged client and the user's keyboard and pointer, not between it and
+   a PING.
+
+   Written as a switch over `enum uictl_op` with **no default**, so
+   -Wswitch makes adding an opcode to the enum without answering this
+   question a build warning. M5.5 adds buttons, relative motion and
+   scroll; each one has to come here and say yes. An out-of-range value
+   from the wire is validated by the dispatch switch below — reaching
+   here it simply falls through to 0, which is safe because a frame that
+   is not a known opcode never executes anything. */
+static int op_touches_device(uint16_t op) {
+  switch ((enum uictl_op)op) {
+  case OP_MOVE_ABS:
+  case OP_KEY_TAP:
+  case OP_KEY_SEQUENCE:
+  case OP_KEY_DOWN:
+  case OP_KEY_UP:
+  /* M5.5's four, each of which the -Wswitch above forced someone to
+     answer for. All yes: a click, a nudge and a scroll all reach the
+     user's pointer, and a batch is a container for the rest. There is no
+     "pointer motion is harmless" exemption — a flagged client that can
+     move the pointer and click can do anything the user can. */
+  case OP_BUTTON:
+  case OP_MOVE_REL:
+  case OP_SCROLL:
+  case OP_BATCH:
+    return 1;
+  case OP_INVALID:
+  case OP_PING:
+  case OP_HELLO:
+  case OP_CONFIRM_SUBSCRIBE:
+  case OP_CONFIRM_REQUEST:
+  case OP_CONFIRM_DECIDE:
+    return 0;
+  }
+  return 0;
+}
+
+/* The keycode a human needs to see, or 0 where the opcode has none.
+   MOVE_ABS deliberately reports 0 rather than coordinates: the prompt
+   says "this client wants to move the pointer", which is the decision
+   being made, and pixel values would be content rather than intent. */
+static uint16_t confirm_keycode_of(const struct conn *c) {
+  if (c->parked_hdr.opcode == OP_KEY_TAP ||
+      c->parked_hdr.opcode == OP_KEY_DOWN ||
+      c->parked_hdr.opcode == OP_KEY_UP) {
+    struct uictl_payload_key k;
+    decode_key(c->parked_payload, &k);
+    return k.keycode;
+  }
+  return 0;
+}
+
+/* Stage the prompt on the confirmer's connection. Unlike every other
+   frame the daemon writes, this is not a response: the header is built
+   here rather than echoed from a request, and `seq` carries the token so
+   a confirmer can correlate without decoding the payload. */
+static int confirm_push(struct conn *cf, const struct conn *req,
+                        uint32_t token) {
+  struct uictl_payload_confirm_req p;
+  memset(&p, 0, sizeof(p));
+  p.token = token;
+  p.peer_pid = (uint32_t)req->cred.pid;
+  p.opcode = req->parked_hdr.opcode;
+  p.keycode = confirm_keycode_of(req);
+  p.cl = (uint16_t)req->cl;
+  memcpy(p.client_name, req->client_name, sizeof(p.client_name));
+
+  struct uictl_frame_header h = {.version = cf->proto_selected,
+                                 .opcode = OP_CONFIRM_REQUEST,
+                                 .source_tag = 0,
+                                 .seq = token,
+                                 .payload_len = sizeof(p)};
+  if (HDR_SIZE + sizeof(p) > sizeof(cf->out))
+    return -1;
+  encode_frame_header(&h, cf->out);
+  memcpy(cf->out + HDR_SIZE, &p, sizeof(p));
+  cf->out_len = HDR_SIZE + sizeof(p);
+  cf->out_sent = 0;
+  return 0;
+}
+
+/* Park `c`'s current frame and prompt. Returns OK if parked (the caller
+   must NOT reply), or the result code to answer with instead. */
+static uint16_t confirm_park(int epfd, struct conn *c) {
+  if (pending_confirm.active)
+    return ERR_BUSY; /* one at a time, see the CONFIRM_* constants */
+  if (c->hdr.payload_len > CONFIRM_MAX_PAYLOAD)
+    return ERR_TOO_LARGE;
+
+  struct conn *cf = confirmer_conn();
+  if (!cf)
+    return ERR_CONFIRM_UNAVAILABLE;
+  /* A confirmer with a reply still going out cannot be handed a prompt:
+     there is one out buffer, and staging over it would drop whichever
+     frame lost the race. Retryable, and in practice a millisecond. */
+  if (cf->out_sent < cf->out_len)
+    return ERR_BUSY;
+
+  c->parked_hdr = c->hdr;
+  memset(c->parked_payload, 0, sizeof(c->parked_payload));
+  memcpy(c->parked_payload, c->buf, c->hdr.payload_len);
+
+  uint32_t token = confirm_token_next++;
+  if (confirm_token_next == 0)
+    confirm_token_next = 1;
+
+  if (confirm_push(cf, c, token) < 0)
+    return ERR_INTERNAL;
+
+  pending_confirm.active = 1;
+  pending_confirm.token = token;
+  pending_confirm.slot = (int)(c - conns);
+  pending_confirm.gen = c->generation;
+  pending_confirm.since = mono_secs();
+  pending_confirm.opcode = c->hdr.opcode;
+
+  c->awaiting_confirm = 1;
+  /* Drop EPOLLIN on the requester now, not after the flush: until the
+     answer arrives this connection must not be read from at all. */
+  (void)conn_update_events(epfd, c);
+
+  int flushed = conn_flush(cf);
+  if (flushed < 0) {
+    /* The confirmer's socket died between the check and the write. Undo
+       the park rather than leave the requester waiting on a prompt that
+       was never delivered. */
+    pending_confirm.active = 0;
+    c->awaiting_confirm = 0;
+    (void)conn_update_events(epfd, c);
+    return ERR_CONFIRM_UNAVAILABLE;
+  }
+  if (flushed > 0) {
+    if (cf->out_since == 0)
+      cf->out_since = mono_secs();
+    (void)conn_update_events(epfd, cf);
+  }
+  return OK;
 }
 
 /* One complete, size-validated frame is in c->hdr + c->buf. */
@@ -1383,7 +1841,8 @@ static uint16_t g_device_caps;
    "muvor thinks there's no keyboard" three milestones later. */
 static uint16_t wire_caps_from_uinput(uint32_t hal_caps) {
   _Static_assert(UINPUT_CAP__ALL ==
-                     (UINPUT_CAP_POINTER_ABS | UINPUT_CAP_KEYBOARD),
+                     (UINPUT_CAP_POINTER_ABS | UINPUT_CAP_KEYBOARD |
+                      UINPUT_CAP_POINTER_REL | UINPUT_CAP_BUTTONS),
                  "a platform capability was added — map it to a wire CAP_* "
                  "bit here and extend this assert");
   uint16_t caps = 0;
@@ -1391,6 +1850,10 @@ static uint16_t wire_caps_from_uinput(uint32_t hal_caps) {
     caps |= CAP_POINTER_ABS;
   if (hal_caps & UINPUT_CAP_KEYBOARD)
     caps |= CAP_KEYBOARD;
+  if (hal_caps & UINPUT_CAP_POINTER_REL)
+    caps |= CAP_POINTER_REL;
+  if (hal_caps & UINPUT_CAP_BUTTONS)
+    caps |= CAP_BUTTONS;
   return caps;
 }
 
@@ -1413,10 +1876,19 @@ static struct uictl_resp_hello daemon_capabilities(uint16_t proto_selected) {
          every way a connection can end, and force-released if a live
          client holds too long. Advertising a way to hold a key without
          all three would be advertising a stuck key. */
+      /* All three confirmation opcodes are advertised, including
+         OP_CONFIRM_REQUEST, which no client ever sends: the bit means
+         "this daemon speaks that frame", and a confirmer needs to know
+         the daemon can push before it subscribes and waits forever. */
       .opcode_bitmap = UICTL_OP_BIT(OP_PING) | UICTL_OP_BIT(OP_MOVE_ABS) |
                        UICTL_OP_BIT(OP_HELLO) | UICTL_OP_BIT(OP_KEY_TAP) |
                        UICTL_OP_BIT(OP_KEY_SEQUENCE) |
-                       UICTL_OP_BIT(OP_KEY_DOWN) | UICTL_OP_BIT(OP_KEY_UP),
+                       UICTL_OP_BIT(OP_KEY_DOWN) | UICTL_OP_BIT(OP_KEY_UP) |
+                       UICTL_OP_BIT(OP_CONFIRM_SUBSCRIBE) |
+                       UICTL_OP_BIT(OP_CONFIRM_REQUEST) |
+                       UICTL_OP_BIT(OP_CONFIRM_DECIDE) |
+                       UICTL_OP_BIT(OP_BUTTON) | UICTL_OP_BIT(OP_MOVE_REL) |
+                       UICTL_OP_BIT(OP_SCROLL) | UICTL_OP_BIT(OP_BATCH),
       .daemon_version = UICTL_DAEMON_VERSION,
       .reserved = 0,
   };
@@ -1452,7 +1924,13 @@ static int conn_version_ok(const struct conn *c, uint16_t version,
   return version >= UICTL_PROTO_MIN && version <= UICTL_PROTO_MAX;
 }
 
-static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
+/* `resumed` is set only by the confirmation path re-feeding a request a
+   human just approved (M5). It skips the two steps that must happen
+   exactly once per request rather than once per dispatch: the rate-limit
+   charge, and the park itself. Charging twice would make confirmation
+   cost a client double; parking twice would prompt forever. */
+static void conn_handle_frame(int epfd, struct conn *c, const struct uinput_devs *devs,
+                              int audit_fd, int resumed) {
   uint16_t result;
   /* 128, not 64: a 31-char client name plus the negotiated version, the
      range it asked for and its class does not fit in 64, and snprintf
@@ -1504,8 +1982,18 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
      depend on the resource that ran out. OP_KEY_DOWN *is* charged: it is
      a device write like any other, and it is the half a client can be
      told to slow down without consequence. */
-  if (c->hdr.opcode == OP_MOVE_ABS || c->hdr.opcode == OP_KEY_TAP ||
-      c->hdr.opcode == OP_KEY_DOWN || c->hdr.opcode == OP_KEY_SEQUENCE) {
+  if (!resumed &&
+      (c->hdr.opcode == OP_MOVE_ABS || c->hdr.opcode == OP_KEY_TAP ||
+       c->hdr.opcode == OP_KEY_DOWN || c->hdr.opcode == OP_KEY_SEQUENCE ||
+       c->hdr.opcode == OP_MOVE_REL || c->hdr.opcode == OP_SCROLL ||
+       c->hdr.opcode == OP_BATCH ||
+       /* A button DOWN is charged; a button UP is not, for the same
+          reason OP_KEY_UP is not: a client that has run out of budget
+          must still be able to let go. Checked on the payload, which is
+          why this reads the buffer rather than only the opcode. */
+       (c->hdr.opcode == OP_BUTTON &&
+        c->hdr.payload_len == sizeof(struct uictl_payload_button) &&
+        ((const struct uictl_payload_button *)(const void *)c->buf)->down))) {
     unsigned cost = 1;
     if (c->hdr.opcode == OP_KEY_SEQUENCE &&
         c->hdr.payload_len >= sizeof(struct uictl_payload_key_seq)) {
@@ -1555,6 +2043,33 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     return;
   }
 
+  /* The confirmation gate (M5). Sits after the handshake — the role is
+     derived from the name a HELLO established — and after the rate
+     limit, so a flooding client is refused before a human is bothered.
+     It sits BEFORE the opcode switch, so there is exactly one place a
+     confirmable request can slip past, and `op_touches_device` is a
+     switch with no default so a new opcode cannot quietly skip it.
+
+     Note what is being gated: the client's *role*, not its source_tag.
+     The plan's original sketch keyed this on `source_tag & SRC_LLM`,
+     which the client writes itself — the LLM agent would simply not set
+     the bit. That is G2, and proto.h names a confirmation prompt as one
+     of the things that must never read that field. */
+  if (!resumed && op_touches_device(c->hdr.opcode) &&
+      (c->roles & ROLE_CONFIRM)) {
+    uint16_t parked = confirm_park(epfd, c);
+    if (parked == OK) {
+      /* No reply, no audit line yet: nothing has been decided. The
+         request is recorded when it resolves, with the outcome. */
+      return;
+    }
+    snprintf(args, sizeof(args), "confirmation not started");
+    audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
+              c->hdr.opcode, c->hdr.seq, parked, args);
+    conn_reply(c, parked);
+    return;
+  }
+
   switch (c->hdr.opcode) {
   case OP_PING:
     result = (c->hdr.payload_len == 0) ? OK : ERR_PAYLOAD_INVALID;
@@ -1576,7 +2091,7 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
       mv.y = 0;
     if (mv.y > ABS_RANGE_MAX)
       mv.y = ABS_RANGE_MAX;
-    result = (uinput_move_abs(uinput_fd, mv.x, mv.y) < 0) ? ERR_INTERNAL : OK;
+    result = (uinput_move_abs(devs->pointer, mv.x, mv.y) < 0) ? ERR_INTERNAL : OK;
     break;
   }
   case OP_HELLO: {
@@ -1658,6 +2173,7 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     c->proto_selected = hi;
     memcpy(c->client_name, hello.client_name, sizeof(c->client_name));
     c->cl = class_for_name(c->client_name);
+    c->roles = roles_for_name(c->client_name);
     c->hello_seen = 1;
 
     caps = daemon_capabilities(c->proto_selected);
@@ -1743,7 +2259,7 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
        the device write failed. An audit line saying a key was injected
        when the write failed would be worse than a late one. */
     snprintf(args, sizeof(args), "code=%u", key.keycode);
-    result = (uinput_key_tap(uinput_fd, key.keycode) < 0) ? ERR_INTERNAL : OK;
+    result = (uinput_key_tap(devs->keyboard, key.keycode) < 0) ? ERR_INTERNAL : OK;
     break;
   }
   case OP_KEY_DOWN: {
@@ -1817,7 +2333,7 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
        failure safe: a recorded hold with no press is invisible until it
        produces a spurious release. */
     struct uinput_key_event down = {.code = key.keycode, .value = 1};
-    if (uinput_key_seq(uinput_fd, &down, 1) < 0) {
+    if (uinput_key_seq(devs->keyboard, &down, 1) < 0) {
       snprintf(args, sizeof(args), "code=%u write failed", key.keycode);
       result = ERR_INTERNAL;
       break;
@@ -1825,6 +2341,449 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     conn_hold_add(c, key.keycode);
     snprintf(args, sizeof(args), "code=%u held (%d total)", key.keycode,
              c->held_count);
+    result = OK;
+    break;
+  }
+  case OP_BUTTON: {
+    /* Buttons are held state, exactly like keys, and reuse M4.5's
+       machinery unchanged: the same per-connection bitset, the same
+       arbitration, the same release on disconnect and the same dead-man
+       timer. That reuse is only correct because BTN_* codes live in the
+       kernel's keycode space, which is why the held bitset was sized
+       0..KEY_MAX rather than 0..(number of keys).
+
+       What is NOT reused is the allowlist. ~/.config/uictl/policy is a
+       list of *keycodes* a user opted into, and requiring `272` in it
+       before a client may click would be a default-deny with no upside:
+       the pointer is not a destructive surface the way KEY_POWER is, a
+       click is visible and reversible, and a user who wanted to forbid
+       clicking would have to be told to write a number they have no way
+       to look up. The deny-list still applies — it just happens to
+       contain no buttons. */
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_button)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_button b;
+    memcpy(&b, c->buf, sizeof(b));
+    if (b.reserved != 0 || b.down > 1) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (!uinput_is_button(b.code)) {
+      snprintf(args, sizeof(args), "code=%u is not a button", b.code);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    const char *bwhy = NULL;
+    if (uinput_keycode_denied(b.code, &bwhy)) {
+      snprintf(args, sizeof(args), "code=%u denied (%s)", b.code, bwhy);
+      result = ERR_KEY_DENYLISTED;
+      break;
+    }
+
+    if (b.down) {
+      if (conn_holds(c, b.code)) {
+        snprintf(args, sizeof(args), "code=%u already held", b.code);
+        result = ERR_KEY_ALREADY_HELD;
+        break;
+      }
+      struct conn *bowner = conn_holder_of(b.code, c);
+      if (bowner) {
+        /* This is G9's pointer-contention case arriving for real: two
+           clients dragging with the same button is the scenario where
+           "whoever releases first releases it for both" produces a drag
+           that never ends. */
+        snprintf(args, sizeof(args), "code=%u held by pid=%d", b.code,
+                 (int)bowner->cred.pid);
+        result = ERR_KEY_HELD_BY_OTHER;
+        break;
+      }
+      if (c->held_count >= MAX_HELD_PER_CONN) {
+        result = ERR_TOO_MANY_HELD;
+        break;
+      }
+      if (uinput_button(devs->pointer, b.code, 1) < 0) {
+        result = ERR_INTERNAL;
+        break;
+      }
+      conn_hold_add(c, b.code);
+      snprintf(args, sizeof(args), "code=%u down", b.code);
+    } else {
+      if (!conn_holds(c, b.code)) {
+        snprintf(args, sizeof(args), "code=%u not held", b.code);
+        result = ERR_KEY_NOT_HELD;
+        break;
+      }
+      conn_hold_drop(c, b.code);
+      if (uinput_button(devs->pointer, b.code, 0) < 0) {
+        result = ERR_INTERNAL;
+        break;
+      }
+      snprintf(args, sizeof(args), "code=%u up", b.code);
+    }
+    result = OK;
+    break;
+  }
+  case OP_MOVE_REL: {
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_move_rel)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_move_rel mv;
+    memcpy(&mv, c->buf, sizeof(mv));
+    /* Bounded, unlike MOVE_ABS which is clamped. A relative delta has no
+       natural ceiling to clamp to, and silently shrinking a nudge from
+       100000 to 32767 would leave a client wondering why its pointer
+       moved a different distance than it asked for. Out of range is an
+       error; in range is exact. */
+    if (mv.dx < -ABS_RANGE_MAX || mv.dx > ABS_RANGE_MAX ||
+        mv.dy < -ABS_RANGE_MAX || mv.dy > ABS_RANGE_MAX) {
+      snprintf(args, sizeof(args), "dx=%d dy=%d out of range", mv.dx, mv.dy);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (mv.dx == 0 && mv.dy == 0) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    snprintf(args, sizeof(args), "dx=%d dy=%d", mv.dx, mv.dy);
+    result = (uinput_move_rel(devs->pointer, mv.dx, mv.dy) < 0) ? ERR_INTERNAL
+                                                                : OK;
+    break;
+  }
+  case OP_SCROLL: {
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_scroll)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_scroll sc;
+    memcpy(&sc, c->buf, sizeof(sc));
+    /* Notches, not pixels. A bound well below the int32 range because
+       the hi-res value is 120x the notch count and must not overflow —
+       a client asking for 20 million notches is broken, not scrolling. */
+    const int32_t max_notches = 1000;
+    if (sc.notches_v < -max_notches || sc.notches_v > max_notches ||
+        sc.notches_h < -max_notches || sc.notches_h > max_notches) {
+      snprintf(args, sizeof(args), "v=%d h=%d out of range", sc.notches_v,
+               sc.notches_h);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (sc.notches_v == 0 && sc.notches_h == 0) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    snprintf(args, sizeof(args), "v=%d h=%d", sc.notches_v, sc.notches_h);
+    result = (uinput_scroll(devs->pointer, sc.notches_v, sc.notches_h) < 0)
+                 ? ERR_INTERNAL
+                 : OK;
+    break;
+  }
+  case OP_BATCH: {
+    /* All-or-nothing, in two passes, for the reason OP_KEY_SEQUENCE is:
+       a per-item check-then-write loop leaves a rejected item's
+       predecessors already delivered, and when one of those was a press
+       that is the stuck-key scenario arriving through the back door.
+       Pass 1 validates every item; pass 2 writes. Nothing between them
+       can fail on policy grounds.
+
+       The batch is atomic PER DEVICE (see proto.h). Pointer items go out
+       as one frame with one SYN_REPORT, keyboard items as another. A
+       modifier+click therefore lands as two reports — which is what it
+       is on real hardware too, where the modifier comes from a keyboard
+       and the click from a mouse. */
+    if (c->hdr.payload_len < sizeof(struct uictl_payload_batch)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_batch bh;
+    memcpy(&bh, c->buf, sizeof(bh));
+    if (bh.reserved != 0 || bh.count == 0 || bh.count > UICTL_BATCH_MAX ||
+        c->hdr.payload_len != uictl_batch_payload_len(bh.count)) {
+      snprintf(args, sizeof(args), "bad batch header count=%u len=%u", bh.count,
+               c->hdr.payload_len);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+
+    struct uictl_batch_item items[UICTL_BATCH_MAX];
+    memcpy(items, c->buf + sizeof(bh),
+           (size_t)bh.count * sizeof(struct uictl_batch_item));
+
+    /* PASS 1 — structure, range and policy for every item.
+       `would_hold` tracks presses this batch has already accounted for,
+       so a batch containing the same button twice is rejected rather
+       than double-counted against the held set. */
+    uint16_t batch_result = OK;
+    int pointer_items = 0, keyboard_items = 0;
+    unsigned char would_hold[HELD_BITS_BYTES];
+    memcpy(would_hold, c->held_bits, sizeof(would_hold));
+    int would_count = c->held_count;
+
+    for (uint16_t i = 0; i < bh.count && batch_result == OK; i++) {
+      const struct uictl_batch_item *it = &items[i];
+      if (it->reserved != 0) {
+        snprintf(args, sizeof(args), "item %u reserved not zero", i);
+        batch_result = ERR_PAYLOAD_INVALID;
+        break;
+      }
+      switch (it->opcode) {
+      case OP_MOVE_ABS:
+      case OP_MOVE_REL:
+      case OP_SCROLL:
+        pointer_items++;
+        if (it->opcode == OP_MOVE_REL &&
+            (it->a < -ABS_RANGE_MAX || it->a > ABS_RANGE_MAX ||
+             it->b < -ABS_RANGE_MAX || it->b > ABS_RANGE_MAX)) {
+          snprintf(args, sizeof(args), "item %u delta out of range", i);
+          batch_result = ERR_PAYLOAD_INVALID;
+        } else if (it->opcode == OP_SCROLL &&
+                   (it->a < -1000 || it->a > 1000 || it->b < -1000 ||
+                    it->b > 1000)) {
+          snprintf(args, sizeof(args), "item %u scroll out of range", i);
+          batch_result = ERR_PAYLOAD_INVALID;
+        }
+        break;
+      case OP_BUTTON: {
+        pointer_items++;
+        uint16_t code = (uint16_t)it->a;
+        if (it->a < 0 || !uinput_is_button(code) || it->b < 0 || it->b > 1) {
+          snprintf(args, sizeof(args), "item %u bad button", i);
+          batch_result = ERR_PAYLOAD_INVALID;
+          break;
+        }
+        int held_here = (would_hold[code / 8] & (1u << (code % 8))) != 0;
+        if (it->b == 1) {
+          if (held_here || conn_holder_of(code, c)) {
+            snprintf(args, sizeof(args), "item %u code=%u already held", i,
+                     code);
+            batch_result = held_here ? ERR_KEY_ALREADY_HELD
+                                     : ERR_KEY_HELD_BY_OTHER;
+            break;
+          }
+          if (would_count >= MAX_HELD_PER_CONN) {
+            batch_result = ERR_TOO_MANY_HELD;
+            break;
+          }
+          would_hold[code / 8] |= (unsigned char)(1u << (code % 8));
+          would_count++;
+        } else {
+          if (!held_here) {
+            snprintf(args, sizeof(args), "item %u code=%u not held", i, code);
+            batch_result = ERR_KEY_NOT_HELD;
+            break;
+          }
+          would_hold[code / 8] &= (unsigned char)~(1u << (code % 8));
+          would_count--;
+        }
+        break;
+      }
+      case OP_KEY_DOWN:
+      case OP_KEY_UP: {
+        keyboard_items++;
+        uint16_t code = (uint16_t)it->a;
+        if (it->a < 1 || it->a > UINPUT_KEY_CODE_MAX) {
+          snprintf(args, sizeof(args), "item %u code out of range", i);
+          batch_result = ERR_PAYLOAD_INVALID;
+          break;
+        }
+        const char *iwhy = NULL;
+        if (uinput_keycode_denied(code, &iwhy)) {
+          snprintf(args, sizeof(args), "item %u code=%u denied (%s)", i, code,
+                   iwhy);
+          batch_result = ERR_KEY_DENYLISTED;
+          break;
+        }
+        if (!key_allowed(code)) {
+          snprintf(args, sizeof(args), "item %u code=%u not in allowlist", i,
+                   code);
+          batch_result = ERR_KEY_NOT_ALLOWED;
+          break;
+        }
+        int held_here = (would_hold[code / 8] & (1u << (code % 8))) != 0;
+        if (it->opcode == OP_KEY_DOWN) {
+          if (held_here || conn_holder_of(code, c)) {
+            batch_result =
+                held_here ? ERR_KEY_ALREADY_HELD : ERR_KEY_HELD_BY_OTHER;
+            snprintf(args, sizeof(args), "item %u code=%u already held", i,
+                     code);
+            break;
+          }
+          if (would_count >= MAX_HELD_PER_CONN) {
+            batch_result = ERR_TOO_MANY_HELD;
+            break;
+          }
+          would_hold[code / 8] |= (unsigned char)(1u << (code % 8));
+          would_count++;
+        } else {
+          if (!held_here) {
+            snprintf(args, sizeof(args), "item %u code=%u not held", i, code);
+            batch_result = ERR_KEY_NOT_HELD;
+            break;
+          }
+          would_hold[code / 8] &= (unsigned char)~(1u << (code % 8));
+          would_count--;
+        }
+        break;
+      }
+      default:
+        snprintf(args, sizeof(args), "item %u opcode %u not batchable", i,
+                 it->opcode);
+        batch_result = ERR_PAYLOAD_INVALID;
+        break;
+      }
+    }
+    if (batch_result != OK) {
+      result = batch_result;
+      break;
+    }
+
+    /* PASS 2 — write. Keyboard items first, as one frame, then pointer
+       items. Order between the two devices is the modifier-before-click
+       one, which is the only cross-device ordering that matters. */
+    if (keyboard_items) {
+      struct uinput_key_event kevs[UICTL_BATCH_MAX];
+      size_t kn = 0;
+      for (uint16_t i = 0; i < bh.count; i++)
+        if (items[i].opcode == OP_KEY_DOWN || items[i].opcode == OP_KEY_UP) {
+          kevs[kn].code = (uint16_t)items[i].a;
+          kevs[kn].value = items[i].opcode == OP_KEY_DOWN ? 1 : 0;
+          kn++;
+        }
+      if (uinput_key_seq(devs->keyboard, kevs, kn) < 0) {
+        result = ERR_INTERNAL;
+        break;
+      }
+    }
+    int wrote_fail = 0;
+    for (uint16_t i = 0; i < bh.count && !wrote_fail; i++) {
+      const struct uictl_batch_item *it = &items[i];
+      switch (it->opcode) {
+      case OP_MOVE_ABS: {
+        int32_t x = it->a < 0 ? 0 : (it->a > ABS_RANGE_MAX ? ABS_RANGE_MAX
+                                                           : it->a);
+        int32_t y = it->b < 0 ? 0 : (it->b > ABS_RANGE_MAX ? ABS_RANGE_MAX
+                                                           : it->b);
+        wrote_fail = uinput_move_abs(devs->pointer, x, y) < 0;
+        break;
+      }
+      case OP_MOVE_REL:
+        if (it->a || it->b)
+          wrote_fail = uinput_move_rel(devs->pointer, it->a, it->b) < 0;
+        break;
+      case OP_SCROLL:
+        if (it->a || it->b)
+          wrote_fail = uinput_scroll(devs->pointer, it->a, it->b) < 0;
+        break;
+      case OP_BUTTON:
+        wrote_fail =
+            uinput_button(devs->pointer, (uint16_t)it->a, it->b == 1) < 0;
+        break;
+      default:
+        break; /* keyboard items already went out above */
+      }
+    }
+    if (wrote_fail) {
+      result = ERR_INTERNAL;
+      break;
+    }
+
+    /* The held set is updated only after every write succeeded, and from
+       the shadow copy pass 1 built — so it can never claim a hold the
+       device did not take. */
+    for (uint16_t i = 0; i < bh.count; i++) {
+      const struct uictl_batch_item *it = &items[i];
+      if (it->opcode == OP_BUTTON || it->opcode == OP_KEY_DOWN ||
+          it->opcode == OP_KEY_UP) {
+        uint16_t code = (uint16_t)it->a;
+        int down = (it->opcode == OP_KEY_DOWN) ||
+                   (it->opcode == OP_BUTTON && it->b == 1);
+        if (down)
+          conn_hold_add(c, code);
+        else
+          conn_hold_drop(c, code);
+      }
+    }
+    snprintf(args, sizeof(args), "batch n=%u (%d pointer, %d keyboard)",
+             bh.count, pointer_items, keyboard_items);
+    result = OK;
+    break;
+  }
+  case OP_CONFIRM_SUBSCRIBE: {
+    /* Config-gated: a client may only become the confirmer if the local
+       registry gave its name the `confirmer` role. Without that check
+       any client could subscribe and then approve its own requests,
+       which is not a gate but a formality.
+
+       Worth stating plainly, because it bounds what M5 is: names are
+       self-asserted at HELLO, so a hostile local process can claim the
+       confirmer's name and approve itself. Nothing name-based can stop
+       that — the socket authenticates a uid, not a binary, which is the
+       entire reason this broker exists. Confirmation is a speed bump
+       between a *cooperative* flagged client and the user's keyboard,
+       not a boundary against a hostile one. The deny-list, the
+       allowlist and the rate limit are what bound a hostile client. */
+    if (c->hdr.payload_len != 0) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (!(c->roles & ROLE_CONFIRMER)) {
+      snprintf(args, sizeof(args), "name=%s lacks the confirmer role",
+               c->client_name);
+      result = ERR_NOT_CONFIRMER;
+      break;
+    }
+    struct conn *existing = confirmer_conn();
+    if (existing && existing != c) {
+      /* First subscriber wins. The alternative — newest wins — lets any
+         client that can claim the name silently displace a live
+         confirmer, and the displaced one has no way to know. */
+      snprintf(args, sizeof(args), "a confirmer is already subscribed");
+      result = ERR_NOT_CONFIRMER;
+      break;
+    }
+    c->is_confirmer = 1;
+    snprintf(args, sizeof(args), "confirmer subscribed name=%s",
+             c->client_name);
+    fprintf(stderr, "uictld: confirmer subscribed: name=%s pid=%d\n",
+            c->client_name, (int)c->cred.pid);
+    result = OK;
+    break;
+  }
+  case OP_CONFIRM_DECIDE: {
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_confirm_decide)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (!c->is_confirmer) {
+      snprintf(args, sizeof(args), "not the confirmer");
+      result = ERR_NOT_CONFIRMER;
+      break;
+    }
+    struct uictl_payload_confirm_decide dec;
+    memcpy(&dec, c->buf, sizeof(dec));
+    if (dec.reserved[0] || dec.reserved[1] || dec.reserved[2]) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (!pending_confirm.active || dec.token != pending_confirm.token) {
+      /* A stale token is the normal case, not an error condition worth
+         alarming about: the request timed out, or its client went away,
+         while the human was deciding. Answering OK would tell the
+         confirmer its decision was applied. */
+      snprintf(args, sizeof(args), "stale token %u", dec.token);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    /* Deferred: the decision is applied after this reply is staged, in
+       conn_readable. Applying it here would re-enter conn_handle_frame
+       for a *different* connection while this one is mid-dispatch, and
+       that connection's reply would be staged into the wrong buffer.
+       The flag is consumed exactly once. */
+    c->confirm_verdict = dec.allow == 1 ? 1 : -1;
+    snprintf(args, sizeof(args), "%s token=%u",
+             dec.allow == 1 ? "allowed" : "denied", dec.token);
     result = OK;
     break;
   }
@@ -1868,7 +2827,7 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
        uinput's own stderr are the report; the bit is not a retry queue. */
     struct uinput_key_event up = {.code = key.keycode, .value = 0};
     conn_hold_drop(c, key.keycode);
-    if (uinput_key_seq(uinput_fd, &up, 1) < 0) {
+    if (uinput_key_seq(devs->keyboard, &up, 1) < 0) {
       snprintf(args, sizeof(args), "code=%u write failed", key.keycode);
       result = ERR_INTERNAL;
       break;
@@ -1998,7 +2957,7 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
          i++)
       n += snprintf(args + n, sizeof(args) - (size_t)n, " %u%s", evs[i].code,
                     evs[i].value ? "v" : "^");
-    result = (uinput_key_seq(uinput_fd, evs, hdr.count) < 0) ? ERR_INTERNAL : OK;
+    result = (uinput_key_seq(devs->keyboard, evs, hdr.count) < 0) ? ERR_INTERNAL : OK;
     break;
   }
   default:
@@ -2006,8 +2965,29 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     break;
   }
 
-  audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
-            c->hdr.opcode, c->hdr.seq, result, args);
+  /* Successful motion is accumulated, not logged line by line (G10).
+     Everything else — including every failed motion request — takes the
+     normal path. */
+  if (result == OK && op_is_motion(c->hdr.opcode)) {
+    int32_t a = 0, b = 0;
+    if (c->hdr.opcode == OP_MOVE_ABS &&
+        c->hdr.payload_len == sizeof(struct uictl_payload_move_abs)) {
+      struct uictl_payload_move_abs mv;
+      decode_move_abs(c->buf, &mv);
+      a = mv.x;
+      b = mv.y;
+    } else if (c->hdr.payload_len == sizeof(struct uictl_payload_move_rel)) {
+      struct uictl_payload_move_rel mv;
+      memcpy(&mv, c->buf, sizeof(mv));
+      a = mv.dx;
+      b = mv.dy;
+    }
+    motion_note(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
+                c->hdr.opcode, a, b);
+  } else {
+    audit_log(audit_fd, c->cred.pid, c->cred.uid, c->hdr.source_tag,
+              c->hdr.opcode, c->hdr.seq, result, args);
+  }
   /* An answer rides along only on success: an error response is a bare
      result code for every opcode, so a client never has to decide
      whether a failed request left it a half-filled struct. */
@@ -2033,7 +3013,75 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
    priority queue, no fairness counter to keep consistent. (Third thing
    level-triggered mode gives us for free, after re-arming EPOLLIN post
    EPOLLOUT stall and never having to remember "there may be more".) */
-static void conn_readable(int epfd, struct conn *c, int uinput_fd,
+/* Apply a decision to the parked request. Defined here because the
+   allow path re-feeds the request through conn_handle_frame above.
+
+   Every exit clears `pending_confirm` first: a resolve that returns
+   early with the slot still marked active would wedge the whole
+   confirmation channel until the daemon restarted, since there is only
+   one. */
+static void confirm_resolve(int epfd, const struct uinput_devs *devs,
+                          int audit_fd, int allow,
+                            uint16_t deny_result, const char *why) {
+  if (!pending_confirm.active)
+    return;
+  struct conn *req = confirm_requester();
+  pending_confirm.active = 0;
+  if (!req)
+    return; /* the requester is gone; there is nobody to answer */
+
+  req->awaiting_confirm = 0;
+
+  if (allow) {
+    /* Restore the frame exactly as it was validated, then dispatch it as
+       resumed — no second rate charge, no second prompt. The audit line
+       is written by the handler with the real outcome, which is why the
+       park wrote none. */
+    req->hdr = req->parked_hdr;
+    memcpy(req->buf, req->parked_payload, req->parked_hdr.payload_len);
+    audit_log(audit_fd, req->cred.pid, req->cred.uid,
+              req->parked_hdr.source_tag, req->parked_hdr.opcode,
+              req->parked_hdr.seq, OK, "confirmed by user");
+    conn_handle_frame(epfd, req, devs, audit_fd, 1);
+  } else {
+    audit_log(audit_fd, req->cred.pid, req->cred.uid,
+              req->parked_hdr.source_tag, req->parked_hdr.opcode,
+              req->parked_hdr.seq, deny_result, why);
+    /* conn_reply echoes c->hdr, which the park may have moved past —
+       restore the header so the client can match the reply to the
+       request it is still waiting on. */
+    req->hdr = req->parked_hdr;
+    conn_reply(req, deny_result);
+  }
+  explicit_bzero(req->parked_payload, sizeof(req->parked_payload));
+
+  int flushed = conn_flush(req);
+  if (conn_after_flush(epfd, req, flushed, devs, audit_fd) == 0) {
+    /* Re-arm. conn_after_flush only touches the epoll mask when a reply
+       is still queued; here the mask is 0 because the connection was
+       parked, and nothing else would ever set it back. */
+    (void)conn_update_events(epfd, req);
+  }
+}
+
+static void confirm_on_conn_closed(int epfd, struct conn *gone, const struct uinput_devs *devs,
+                                   int audit_fd) {
+  if (!pending_confirm.active)
+    return;
+  /* The requester itself is going away: drop the pending confirmation
+     without answering. Checked by slot AND generation, so a slot that
+     has since been reused is not mistaken for the original requester. */
+  if ((int)(gone - conns) == pending_confirm.slot &&
+      gone->generation == pending_confirm.gen) {
+    pending_confirm.active = 0;
+    return;
+  }
+  if (gone->is_confirmer)
+    confirm_resolve(epfd, devs, audit_fd, 0, ERR_CONFIRM_UNAVAILABLE,
+                    "confirmer disconnected");
+}
+
+static void conn_readable(int epfd, struct conn *c, const struct uinput_devs *devs,
                           int audit_fd) {
   unsigned dispatched = 0;
 
@@ -2046,11 +3094,11 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
         if (errno == EAGAIN || errno == EWOULDBLOCK)
           return; /* socket drained; wait for the next EPOLLIN */
         perror("uictld: read client");
-        conn_close(epfd, c, uinput_fd, audit_fd);
+        conn_close(epfd, c, devs, audit_fd);
         return;
       }
       if (r == 0) { /* peer EOF */
-        conn_close(epfd, c, uinput_fd, audit_fd);
+        conn_close(epfd, c, devs, audit_fd);
         return;
       }
       if (c->have == 0 && c->phase == CONN_WANT_HEADER)
@@ -2087,7 +3135,7 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
            closed immediately; if it didn't drain, the client learned
            nothing but "connection reset". */
         c->close_after_flush = 1;
-        (void)conn_after_flush(epfd, c, conn_flush(c), uinput_fd, audit_fd);
+        (void)conn_after_flush(epfd, c, conn_flush(c), devs, audit_fd);
         return;
       }
 
@@ -2101,22 +3149,52 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
          returns 0, which is indistinguishable from EOF. */
     }
 
-    conn_handle_frame(c, uinput_fd, audit_fd);
-    int flushed = conn_flush(c);
+    conn_handle_frame(epfd, c, devs, audit_fd, 0);
 
-    /* Reset for the next frame on this same connection. Done before the
-       flush verdict is acted on: the request has been fully consumed and
-       answered either way, so the read state is stale regardless of
-       whether the reply made it out. */
+    /* Reset for the next frame on this same connection. Hoisted above
+       everything that follows because the frame is fully consumed the
+       moment the handler returns, on every path — including the M5 park,
+       which returns without staging a reply.
+
+       Leaving it below the park check was a real bug, and an instructive
+       one: the connection resumed still in CONN_WANT_PAYLOAD with
+       have == want, so the next read asked the kernel for zero bytes,
+       got 0 back, and every caller reads a 0-byte read as EOF. The
+       symptom was the daemon dropping a client the instant its
+       confirmation was approved. Wiping c->buf here is safe because
+       confirm_park copied the payload out first. */
     c->phase = CONN_WANT_HEADER;
     c->want = HDR_SIZE;
     c->have = 0;
     explicit_bzero(c->buf, sizeof(c->buf));
 
+    /* Parked for confirmation: nothing staged, nothing to flush, and
+       EPOLLIN already dropped. The decision restarts this connection. */
+    if (c->awaiting_confirm) {
+      c->frames_served++;
+      return;
+    }
+
+    int flushed = conn_flush(c);
+
     /* -1 means closed, or queued and waiting on EPOLLOUT. Either way we
        stop parsing: with one out buffer, handling the next pipelined
        frame here would clobber the reply still in flight. */
-    if (conn_after_flush(epfd, c, flushed, uinput_fd, audit_fd) < 0)
+    int alive = conn_after_flush(epfd, c, flushed, devs, audit_fd);
+
+    /* A decision staged by THIS frame is applied now: after its own
+       reply is on the wire, and outside conn_handle_frame, so the
+       requester's reply is staged into the requester's buffer and not
+       into the confirmer's. Read and cleared exactly once — a verdict
+       left set would be re-applied to whatever confirmation came next. */
+    if (c->confirm_verdict != 0) {
+      int verdict = c->confirm_verdict;
+      c->confirm_verdict = 0;
+      confirm_resolve(epfd, devs, audit_fd, verdict > 0,
+                      ERR_CONFIRM_DENIED, "denied by user");
+    }
+
+    if (alive < 0)
       return;
 
     /* Counted here, per *dispatched frame* — not per read() and not per
@@ -2146,8 +3224,24 @@ static int conn_frame_in_progress(const struct conn *c) {
 /* One timer, scanned against the whole table — not one timer per
    connection. At <= 32 slots the scan is cheaper than 32 timerfds, and
    there is no per-connection fd to leak on close. */
-static void conn_reap_partial(int epfd, int uinput_fd, int audit_fd) {
+static void conn_reap_partial(int epfd, const struct uinput_devs *devs,
+                          int audit_fd) {
   time_t now = mono_secs();
+
+  /* G10: one line per second per motion stream, written from here so a
+     client that stops moving still gets its final count recorded rather
+     than leaving it in memory until the daemon exits. */
+  motion_flush(audit_fd, 0);
+
+  /* A confirmation nobody answered (M5). Denied, never allowed: a gate
+     that opens when the user is away from the keyboard is not a gate.
+     Same tick as the stall reaper, so the effective deadline is 30-31 s
+     — coarse on purpose, like every other deadline here. */
+  if (pending_confirm.active &&
+      now - pending_confirm.since >= CONFIRM_TIMEOUT_SEC)
+    confirm_resolve(epfd, devs, audit_fd, 0, ERR_CONFIRM_TIMEOUT,
+                    "confirmation timed out");
+
   for (int i = 0; i < MAX_CONNS; i++) {
     struct conn *c = &conns[i];
     if (c->fd < 0)
@@ -2174,7 +3268,7 @@ static void conn_reap_partial(int epfd, int uinput_fd, int audit_fd) {
        together: a partial release would leave it holding a set neither
        side agrees on. */
     if (c->held_count > 0 && now - c->held_since >= HOLD_MAX_SEC) {
-      conn_release_held(c, uinput_fd, audit_fd, "dead-man timer");
+      conn_release_held(c, devs, audit_fd, "dead-man timer");
       /* fall through: this connection may also be stalled */
     }
 
@@ -2210,7 +3304,7 @@ static void conn_reap_partial(int epfd, int uinput_fd, int audit_fd) {
     /* No reply attempt. The peer is by definition not talking, so its
        receive window may be full and a write could block the daemon —
        which is exactly the failure this whole milestone removes. */
-    conn_close(epfd, c, uinput_fd, audit_fd);
+    conn_close(epfd, c, devs, audit_fd);
   }
 }
 
@@ -2238,6 +3332,22 @@ static void conn_dump_table(void) {
 
   fprintf(stderr, "uictld: %d/%d slots used (max %d per pid)\n", used,
           MAX_CONNS, MAX_CONNS_PER_PID);
+  /* The confirmation channel is daemon-wide state, not per connection,
+     so it gets its own line. "no confirmer" is the answer to the most
+     likely question an operator has when a flagged client stops
+     working. */
+  {
+    const struct conn *cf = confirmer_conn();
+    if (cf)
+      fprintf(stderr, "uictld: confirmer: name=%s pid=%d\n", cf->client_name,
+              (int)cf->cred.pid);
+    else
+      fprintf(stderr, "uictld: confirmer: none subscribed\n");
+    if (pending_confirm.active)
+      fprintf(stderr, "uictld: pending confirmation: token=%u op=%s age=%llds\n",
+              pending_confirm.token, opname(pending_confirm.opcode),
+              (long long)(now - pending_confirm.since));
+  }
   for (int i = 0; i < MAX_CONNS; i++) {
     const struct conn *c = &conns[i];
     if (c->fd < 0)
@@ -2404,8 +3514,9 @@ int main(void) {
   }
 
   uint32_t hal_caps = 0;
-  int uinput_fd = uinput_open(&hal_caps);
-  if (uinput_fd < 0) {
+  struct uinput_devs devices = {-1, -1};
+  const struct uinput_devs *devs = &devices;
+  if (uinput_open(&devices, &hal_caps) < 0) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
@@ -2420,21 +3531,27 @@ int main(void) {
      Refuse to start instead. */
   if (g_device_caps == 0) {
     fprintf(stderr, "uictld: device came up with no capabilities\n");
-    uinput_close(uinput_fd);
+    uinput_close(&devices);
     close(audit_fd);
     close(lockfd);
     close(sfd);
     unlink(path);
     return 1;
   }
-  fprintf(stderr, "uictld: device caps 0x%x (%s%s)\n", g_device_caps,
+  /* Two devices since M5.5, and the fds are named so an operator can
+     match them to what /proc/bus/input/devices shows. */
+  fprintf(stderr,
+          "uictld: pointer fd=%d, keyboard fd=%d, caps 0x%x (%s%s%s%s)\n",
+          devices.pointer, devices.keyboard, g_device_caps,
           (g_device_caps & CAP_POINTER_ABS) ? "pointer-abs " : "",
-          (g_device_caps & CAP_KEYBOARD) ? "keyboard" : "");
+          (g_device_caps & CAP_KEYBOARD) ? "keyboard " : "",
+          (g_device_caps & CAP_POINTER_REL) ? "pointer-rel " : "",
+          (g_device_caps & CAP_BUTTONS) ? "buttons" : "");
 
   int sigfd = signalfd(-1, &mask, SFD_CLOEXEC);
   if (sigfd < 0) {
     perror("uictld: signalfd");
-    uinput_close(uinput_fd);
+    uinput_close(&devices);
     close(audit_fd);
     close(lockfd);
     close(sfd);
@@ -2445,7 +3562,7 @@ int main(void) {
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
     perror("uictld: epoll_create1");
-    uinput_close(uinput_fd);
+    uinput_close(&devices);
     close(sigfd);
     close(audit_fd);
     close(lockfd);
@@ -2459,7 +3576,7 @@ int main(void) {
   int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
   if (tfd < 0) {
     perror("uictld: timerfd_create");
-    uinput_close(uinput_fd);
+    uinput_close(&devices);
     close(epfd);
     close(sigfd);
     close(audit_fd);
@@ -2476,7 +3593,7 @@ int main(void) {
   if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
     perror("uictld: timerfd_settime");
     close(tfd);
-    uinput_close(uinput_fd);
+    uinput_close(&devices);
     close(epfd);
     close(sigfd);
     close(audit_fd);
@@ -2556,7 +3673,7 @@ int main(void) {
             perror("uictld: read timerfd");
           continue;
         }
-        conn_reap_partial(epfd, uinput_fd, audit_fd);
+        conn_reap_partial(epfd, devs, audit_fd);
       } else if (is_static && skey == sfd) {
         /* Accept until EAGAIN: one EPOLLIN on the listening socket can
            stand for several queued connections, and level-triggered
@@ -2619,7 +3736,7 @@ int main(void) {
                                     .data.u64 = conn_evkey(c)};
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
             perror("uictld: epoll_ctl ADD client");
-            conn_close(epfd, c, uinput_fd, audit_fd);
+            conn_close(epfd, c, devs, audit_fd);
             continue;
           }
         }
@@ -2628,29 +3745,35 @@ int main(void) {
         if (!c)
           continue; /* connection closed earlier in this same batch */
         if (events[i].events & (EPOLLHUP | EPOLLERR)) {
-          conn_close(epfd, c, uinput_fd, audit_fd);
+          conn_close(epfd, c, devs, audit_fd);
           continue;
         }
         /* Only ever one of the two is registered at a time (see
            conn_update_events), but check both and re-test c->fd:
            conn_writable can close the connection out from under us. */
         if (events[i].events & EPOLLOUT)
-          conn_writable(epfd, c, uinput_fd, audit_fd);
+          conn_writable(epfd, c, devs, audit_fd);
         if (c->fd >= 0 && (events[i].events & EPOLLIN))
-          conn_readable(epfd, c, uinput_fd, audit_fd);
+          conn_readable(epfd, c, devs, audit_fd);
       }
     }
   }
 
   fprintf(stderr, "uictld: shutting down\n");
 
+  /* Anything still accumulating goes to the log before the fd closes.
+     Dropping it would mean the last second of a client's activity is
+     missing exactly when the daemon went down, which is when someone is
+     most likely to read the log. */
+  motion_flush(audit_fd, 1);
+
   /* Close live connections before tearing down the device, so a client
      blocked in read() sees EOF rather than a silently vanished daemon. */
   for (int i = 0; i < MAX_CONNS; i++)
     if (conns[i].fd >= 0)
-      conn_close(epfd, &conns[i], uinput_fd, audit_fd);
+      conn_close(epfd, &conns[i], devs, audit_fd);
 
-  uinput_close(uinput_fd);
+  uinput_close(&devices);
   close(tfd);
   close(sigfd);
   close(epfd);
