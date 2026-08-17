@@ -183,11 +183,27 @@ The HELLO response gains two appended fields (§3, append-only growth
 rule):
 
 ```c
-uint8_t  reconnect_mode;      /* 0 unspecified, 1 fail-fast, 2 backoff */
-uint8_t  reconnect_max_tries; /* 0 = unbounded; only meaningful if mode==2 */
+uint8_t  reconnect_mode;      /* 0 unspecified, 1 never, 2 backoff       */
+uint8_t  reconnect_max_tries; /* 0 = unbounded; only if mode == 2        */
 uint16_t reconnect_base_ms;   /* first delay, doubling each attempt      */
 uint32_t reserved2;           /* MUST be zero */
 ```
+
+The advice comes from the daemon's client registry
+(`~/.config/uictl/clients`), as an optional trailing token alongside the
+existing role words:
+
+```
+muvor      interactive  reconnect=backoff:250:7
+oneshot    standard     reconnect=never
+agent      untrusted    confirm  reconnect=backoff
+```
+
+`reconnect=backoff` with no numbers means 100 ms base, unbounded tries.
+A malformed token drops the **whole entry** and is reported at startup —
+the same all-or-nothing the role words use, because a typo that left a
+half-applied entry would be a config that silently does something other
+than what it says.
 
 `reserved2` is named rather than left to the compiler for the same
 reason `reserved` is: this struct is copied straight onto a socket, and
@@ -255,7 +271,7 @@ implemented in daemon 0.3.0.
 | 8.3.1 forgiving first release | shipped (`conn.held_ever`); `tests/test_wire831_forgive.py` |
 | 8.4 mandatory re-HELLO | shipped (`ERR_HANDSHAKE_REQUIRED`) |
 | 8.5 no replay | client-side rule; no daemon change needed |
-| 8.6 advertised reconnect policy | **not implemented** — HELLO response is 24 bytes |
+| 8.6 advertised reconnect policy | shipped — HELLO response is 32 bytes; `tests/test_m36_identity.py` GG |
 | 8.7 admission backstop | **not implemented** |
 | 8.8 daemon logging | partial — release is logged, activation is not |
 | 8.8 library/CLI visibility | **not implemented** — no `libuictl` yet |

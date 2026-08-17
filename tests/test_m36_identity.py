@@ -216,6 +216,73 @@ try:
                   "back to the floor")
     else:
         fail("EE: daemon would not start for the permissions case")
+
+    # --- GG: WIRE.md §8.6, registry -> advertised reconnect advice ----
+    # Same shape as class and roles: the client says a name, the daemon
+    # decides what that name means, and the answer arrives at HELLO. The
+    # difference is that this one is ADVICE, not a decision -- which is
+    # why an unregistered name gets UNSPEC rather than a restrictive
+    # floor. There is nothing to fail safe about: the daemon simply has
+    # no opinion about a client it has never heard of, and saying so
+    # lets that client apply the default for its own shape.
+    RC_REGISTRY = """# reconnect advice
+muvor      interactive  reconnect=backoff:250:7
+oneshot    standard     reconnect=never
+plain      standard
+sloppy     standard     reconnect=backoff:0
+noisy      standard     reconnect=sideways
+"""
+    d3 = start_daemon(home, RC_REGISTRY)
+    if d3.poll() is not None:
+        fail("GG: daemon would not start for the reconnect case")
+    else:
+        def advice(name):
+            """(mode, tries, base_ms) from the §8.6 tail of the HELLO reply."""
+            s = conn()
+            s.sendall(frame(OP_HELLO, hello_payload(name)))
+            r = s.recv(16)
+            plen = struct.unpack(HDR, r)[4]
+            body = b""
+            while len(body) < plen:
+                body += s.recv(plen - len(body))
+            s.close()
+            data = body[2:]                    # skip `result`
+            if len(data) < 32:
+                return None
+            return struct.unpack_from("<BBH", data, 24)
+
+        cases = [
+            (b"muvor",   (2, 7, 250), "explicit backoff, both numbers"),
+            (b"oneshot", (1, 0, 0),   "never"),
+            # Registered but with no reconnect= token: the daemon still
+            # has no opinion. Being in the registry must not silently opt
+            # a client into a policy nobody wrote down.
+            (b"plain",   (0, 0, 0),   "registered without advice -> UNSPEC"),
+            # Malformed entries are dropped WHOLE, so the name ends up
+            # unregistered and lands on UNSPEC. Same all-or-nothing the
+            # roles parser uses, for the same reason: a typo must not
+            # leave a half-applied config.
+            (b"sloppy",  (0, 0, 0),   "base 0 rejected -> entry dropped"),
+            (b"noisy",   (0, 0, 0),   "bad mode rejected -> entry dropped"),
+            (b"nobody",  (0, 0, 0),   "never mentioned -> UNSPEC"),
+        ]
+        for name, want, why in cases:
+            got = advice(name)
+            if got is None:
+                fail("GG: %s -- HELLO reply had no §8.6 tail" % name.decode())
+            elif got != want:
+                fail("GG: %s (%s) advertised %s, expected %s"
+                     % (name.decode(), why, got, want))
+        err3 = stop_daemon(d3)
+        # Dropped entries must be reported. A config that silently does
+        # nothing is worse than one that is rejected.
+        if "reconnect base ms" not in err3:
+            fail("GG: `reconnect=backoff:0` was dropped without saying why")
+        elif "bad reconnect 'sideways'" not in err3:
+            fail("GG: `reconnect=sideways` was dropped without saying why")
+        elif ok:
+            print("GG registry drives the reconnect advice; bad entries are "
+                  "dropped whole and reported")
 finally:
     shutil.rmtree(home, ignore_errors=True)
 

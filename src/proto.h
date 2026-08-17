@@ -548,6 +548,23 @@ _Static_assert(sizeof(struct uictl_payload_confirm_decide) == 8,
    memcpy'd straight onto a socket. Uninitialised padding on the wire is
    a stack-content leak to whatever is listening. Naming the field means
    it gets zeroed like everything else. */
+/* Reconnect advice (WIRE.md §8.6). ADVISORY — the daemon cannot enforce
+   any of it, because the decision is taken in the client's process and
+   usually at a moment when the daemon is not running. It is issued at
+   handshake time so a client has it cached for the *next* outage.
+
+   RECONNECT_UNSPEC means the daemon has no opinion and the client
+   applies the default for its own shape: one-shots fail fast, long-lived
+   clients back off. A daemon too old to send these fields is
+   indistinguishable from one sending UNSPEC, which is why UNSPEC is 0.
+
+   What actually bounds a client that ignores all of this is the
+   admission backstop (§8.7), on the daemon's side of the socket. Do not
+   mistake advice for a control. */
+#define RECONNECT_UNSPEC 0u  /* no advice; client uses its own default */
+#define RECONNECT_NEVER 1u   /* fail fast, do not reconnect            */
+#define RECONNECT_BACKOFF 2u /* retry with exponential backoff         */
+
 struct uictl_resp_hello {
   uint16_t proto_selected; /* version the daemon will speak on this conn */
   uint16_t device_caps;    /* CAP_* bits */
@@ -555,10 +572,31 @@ struct uictl_resp_hello {
   uint64_t opcode_bitmap;  /* bit N set => opcode N is implemented */
   uint32_t daemon_version; /* UICTL_DAEMON_VERSION, informational */
   uint32_t reserved;       /* MUST be zero; not padding, see above */
+
+  /* Appended for §8.6 — the first use of the append-only growth rule
+     this struct was designed around. No version bump and no flag day: a
+     client built against the 24-byte struct reads the prefix it knows
+     and ignores the tail. That stays true only while nothing above this
+     line ever moves, resizes, or is reordered.
+
+     `reserved` was deliberately NOT repurposed, though it is four unused
+     bytes sitting right here. tests/test_m36_hello.py asserts it is
+     zero, as a canary for uninitialised stack bytes reaching the wire.
+     Spending it would have meant deleting a security check to save four
+     bytes on a message sent once per connection. */
+  uint8_t reconnect_mode;      /* RECONNECT_* above                      */
+  uint8_t reconnect_max_tries; /* 0 = unbounded; only if mode == BACKOFF */
+  uint16_t reconnect_base_ms;  /* first delay, doubling each attempt     */
+  uint32_t reserved2;          /* MUST be zero; same reason as reserved  */
 };
 
-_Static_assert(sizeof(struct uictl_resp_hello) == 24,
-               "HELLO response must be exactly 24 bytes");
+_Static_assert(sizeof(struct uictl_resp_hello) == 32,
+               "HELLO response must be exactly 32 bytes");
+
+/* The prefix a pre-§8.6 client reads. Named because the append-only rule
+   is only real if the old size stays meaningful: a client that demands
+   exactly 32 bytes has already broken it for the next field. */
+#define UICTL_RESP_HELLO_V1_SIZE 24u
 
 /* Bit N of opcode_bitmap is opcode N, so the map covers opcodes 0..63
    and bit 0 (OP_INVALID) is never set. 64 is not a limit worth worrying

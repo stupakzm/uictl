@@ -132,6 +132,32 @@ else:
     if reserved != 0:
         fail("Q: reserved=0x%x -- uninitialised bytes are leaking onto the "
              "wire" % reserved)
+
+    # --- QR: the §8.6 tail --------------------------------------------
+    # Note what did NOT have to change to add these: the length check
+    # above is >= and the unpack is unpack_from, so a suite written
+    # against the 24-byte response kept passing when the response grew to
+    # 32. That is the append-only rule being real rather than asserted --
+    # and it is the same reason an old client keeps working.
+    if len(data) < 32:
+        fail("QR: response is %d bytes, expected >= 32 since §8.6" % len(data))
+    else:
+        (rmode, rtries, rbase, reserved2) = struct.unpack_from("<BBHI", data, 24)
+        # This suite runs against the real $HOME, which has no client
+        # registry, so `probe` is unregistered. The daemon has no opinion
+        # about a client it has never heard of and must say so rather
+        # than inventing one -- an unregistered client picking its own
+        # default is the correct outcome, not a gap.
+        if rmode != 0:
+            fail("QR: reconnect_mode=%d for an unregistered client, expected "
+                 "RECONNECT_UNSPEC(0)" % rmode)
+        if reserved2 != 0:
+            fail("QR: reserved2=0x%x -- same stack-leak canary as reserved, "
+                 "and the reason reserved was not repurposed for these "
+                 "fields" % reserved2)
+        else:
+            print("QR §8.6 tail present: mode=%d tries=%d base=%dms, "
+                  "reserved2 clean" % (rmode, rtries, rbase))
     # An unadvertised opcode must actually be refused. Since task 7 this
     # needs a handshake first -- pre-handshake every opcode answers
     # ERR_HANDSHAKE_REQUIRED, which is case P's job to check.

@@ -196,10 +196,23 @@ static int class_from_word(const char *word, enum client_class *out) {
 #define ROLE_CONFIRM (1u << 0)
 #define ROLE_CONFIRMER (1u << 1)
 
+/* Defaults when an entry says `reconnect=backoff` with no numbers. 100 ms
+   doubling is slow enough not to be a storm and fast enough that a
+   socket-activated daemon is back before a user notices. */
+#define RECONNECT_DEFAULT_BASE_MS 100
+#define RECONNECT_DEFAULT_MAX_TRIES 0 /* unbounded */
+
 struct client_reg {
   char name[UICTL_CLIENT_NAME_MAX];
   enum client_class cl;
   unsigned roles;
+  /* WIRE.md §8.6. Advice handed to this client at HELLO, for it to use
+     during the *next* outage — which is the only time it can be used, so
+     it has to arrive before the outage. The daemon cannot enforce it and
+     does not try; §8.7's admission backstop is what actually holds. */
+  uint8_t reconnect_mode;
+  uint8_t reconnect_max_tries;
+  uint16_t reconnect_base_ms;
 };
 
 static struct client_reg registry[MAX_REGISTERED_CLIENTS];
@@ -328,10 +341,75 @@ static void load_client_registry(void) {
         entry.roles |= ROLE_CONFIRM;
       else if (strcmp(r, "confirmer") == 0)
         entry.roles |= ROLE_CONFIRMER;
-      else {
+      else if (strncmp(r, "reconnect=", 10) == 0) {
+        /* reconnect=never
+           reconnect=backoff
+           reconnect=backoff:BASE_MS
+           reconnect=backoff:BASE_MS:MAX_TRIES
+
+           Parsed here rather than at HELLO for the same reason the class
+           is: config read once at startup means a client's advice cannot
+           change halfway through a session depending on when it
+           connected. */
+        const char *v = r + 10;
+        if (strcmp(v, "never") == 0) {
+          entry.reconnect_mode = (uint8_t)RECONNECT_NEVER;
+        } else if (strncmp(v, "backoff", 7) == 0 &&
+                   (v[7] == '\0' || v[7] == ':')) {
+          entry.reconnect_mode = (uint8_t)RECONNECT_BACKOFF;
+          entry.reconnect_base_ms = RECONNECT_DEFAULT_BASE_MS;
+          entry.reconnect_max_tries = RECONNECT_DEFAULT_MAX_TRIES;
+          if (v[7] == ':') {
+            char *end = NULL;
+            long base = strtol(v + 8, &end, 10);
+            /* Bounded by the field, not just by taste: reconnect_base_ms
+               is a uint16_t, and a value that does not fit would be
+               silently truncated into a much more aggressive retry than
+               the operator asked for. */
+            if (end == v + 8 || base < 1 || base > 65535) {
+              fprintf(stderr,
+                      "uictld: client registry line %d: reconnect base ms "
+                      "must be 1..65535 — dropping the whole entry\n",
+                      line_no);
+              role_ok = 0;
+              break;
+            }
+            entry.reconnect_base_ms = (uint16_t)base;
+            if (*end == ':') {
+              const char *t = end + 1;
+              long tries = strtol(t, &end, 10);
+              if (end == t || *end != '\0' || tries < 0 || tries > 255) {
+                fprintf(stderr,
+                        "uictld: client registry line %d: reconnect max "
+                        "tries must be 0..255 — dropping the whole entry\n",
+                        line_no);
+                role_ok = 0;
+                break;
+              }
+              entry.reconnect_max_tries = (uint8_t)tries;
+            } else if (*end != '\0') {
+              fprintf(stderr,
+                      "uictld: client registry line %d: trailing junk in "
+                      "'%s' — dropping the whole entry\n",
+                      line_no, r);
+              role_ok = 0;
+              break;
+            }
+          }
+        } else {
+          fprintf(stderr,
+                  "uictld: client registry line %d: bad reconnect '%s' "
+                  "(expected never|backoff[:BASE_MS[:MAX_TRIES]]) — "
+                  "dropping the whole entry\n",
+                  line_no, v);
+          role_ok = 0;
+          break;
+        }
+      } else {
         fprintf(stderr,
                 "uictld: client registry line %d: unknown role '%s' "
-                "(expected confirm|confirmer) — dropping the whole entry\n",
+                "(expected confirm|confirmer|reconnect=…) — dropping the "
+                "whole entry\n",
                 line_no, r);
         role_ok = 0;
         break;
@@ -341,10 +419,21 @@ static void load_client_registry(void) {
       continue;
 
     registry[registry_len++] = entry;
-    fprintf(stderr, "uictld: client '%s' registered as '%s'%s%s\n", entry.name,
-            class_name(entry.cl),
+    char rc[64] = "";
+    if (entry.reconnect_mode == RECONNECT_NEVER)
+      snprintf(rc, sizeof(rc), " +reconnect=never");
+    else if (entry.reconnect_mode == RECONNECT_BACKOFF) {
+      if (entry.reconnect_max_tries)
+        snprintf(rc, sizeof(rc), " +reconnect=backoff:%ums:%u tries",
+                 entry.reconnect_base_ms, entry.reconnect_max_tries);
+      else
+        snprintf(rc, sizeof(rc), " +reconnect=backoff:%ums:unbounded",
+                 entry.reconnect_base_ms);
+    }
+    fprintf(stderr, "uictld: client '%s' registered as '%s'%s%s%s\n",
+            entry.name, class_name(entry.cl),
             (entry.roles & ROLE_CONFIRM) ? " +confirm" : "",
-            (entry.roles & ROLE_CONFIRMER) ? " +confirmer" : "");
+            (entry.roles & ROLE_CONFIRMER) ? " +confirmer" : "", rc);
   }
 }
 
@@ -527,6 +616,19 @@ static enum client_class class_for_name(const char *name) {
     if (strcmp(registry[i].name, name) == 0)
       return registry[i].cl;
   return CLASS_UNTRUSTED;
+}
+
+/* The registry entry, or NULL for an unregistered name. Used only for
+   the §8.6 advice, which is the one piece of per-client config that is
+   not a security decision — so unlike class_for_name and roles_for_name
+   there is no restrictive floor to fall back to. An unknown client gets
+   RECONNECT_UNSPEC and picks its own default, which is correct: the
+   daemon genuinely has no opinion about a client it has never heard of. */
+static const struct client_reg *reg_for_name(const char *name) {
+  for (int i = 0; i < registry_len; i++)
+    if (strcmp(registry[i].name, name) == 0)
+      return &registry[i];
+  return NULL;
 }
 
 /* Roles are opt-in per registry entry, so an unregistered client gets
@@ -2208,6 +2310,20 @@ static void conn_handle_frame(int epfd, struct conn *c, const struct uinput_devs
     c->hello_seen = 1;
 
     caps = daemon_capabilities(c->proto_selected);
+    /* §8.6. Filled here rather than in daemon_capabilities() because it
+       is the only field in the response that depends on *which* client
+       is asking — everything else is a property of the daemon and the
+       device, identical on every connection. */
+    {
+      const struct client_reg *reg = reg_for_name(c->client_name);
+      if (reg) {
+        caps.reconnect_mode = reg->reconnect_mode;
+        caps.reconnect_max_tries = reg->reconnect_max_tries;
+        caps.reconnect_base_ms = reg->reconnect_base_ms;
+      }
+      /* else: left at RECONNECT_UNSPEC/0/0 from the initialiser, which
+         is what an older daemon's absent tail also means. */
+    }
     resp_data = &caps;
     resp_len = sizeof(caps);
 
