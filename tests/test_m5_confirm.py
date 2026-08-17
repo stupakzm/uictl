@@ -213,7 +213,7 @@ try:
         fail("no event node for '%s'" % DEV_NAME)
         raise SystemExit
     try:
-        efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+        efd = uictl_expect.open_node(node)
     except PermissionError:
         print("SKIP: cannot read %s (need the input group)" % node)
         sys.exit(0)
@@ -482,7 +482,7 @@ try:
     if d.poll() is not None:
         print("SKIP: throwaway daemon would not start:", open(errlog).read())
         sys.exit(0)
-    efd = os.open(event_node(), os.O_RDONLY | os.O_NONBLOCK)
+    efd = uictl_expect.open_node(event_node())
     cf = conn()
     hello(cf, "prompter")
     subscribe(cf)

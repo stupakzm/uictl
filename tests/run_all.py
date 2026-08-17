@@ -25,6 +25,8 @@ Exit:   0 if every suite passed or skipped for an environmental reason.
 import os, re, signal, subprocess, socket, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)        # the suites get this for free; the runner
+import uictl_expect             # is invoked as tests/run_all.py, so it does not
 REPO = os.path.dirname(HERE)
 SOCK = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uictld.sock")
 
@@ -144,9 +146,25 @@ def main():
             for suite, _, _ in shared:
                 results[suite] = "FAIL"
         else:
+            # The shared suites never open an event node -- they assert on
+            # result codes -- so none of them grabs, and MOVE_ABS is not
+            # policy-gated: a shared suite CAN move the real pointer, and a
+            # pointer parked in a corner is a hot corner. So the runner
+            # holds the grab on both nodes for the whole shared phase.
+            # Nothing reads these fds; the grab is the entire purpose.
+            grabbed = []
             try:
+                for node in (uictl_expect.pointer_node(),
+                             uictl_expect.keyboard_node()):
+                    if node:
+                        grabbed.append(uictl_expect.open_node(node))
+                if len(grabbed) != 2:
+                    print("  WARNING: only grabbed %d/2 nodes -- injected "
+                          "events may reach your session" % len(grabbed))
                 do("shared")
             finally:
+                for fd in grabbed:
+                    os.close(fd)
                 d.send_signal(signal.SIGTERM)
                 try:
                     d.wait(timeout=10)

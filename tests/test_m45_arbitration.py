@@ -173,6 +173,7 @@ if os.path.exists(SOCK):
 home = make_home("uictl-arbit-")
 d = None
 efd = None
+pfd = None
 try:
     # stderr to a file, not a pipe: AU reads it back while the daemon is
     # still running, and a pipe would either block or need a reader thread.
@@ -190,7 +191,12 @@ try:
         fail("no event node for '%s'" % DEV_NAME)
         raise SystemExit
     try:
-        efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+        efd = uictl_expect.open_node(node)
+        # BA fills the hold cap with buttons, and those land on the
+        # POINTER node. Nothing here reads it -- it is grabbed purely so
+        # that a right-click or a back/forward press does not reach the
+        # session while the cap is being filled.
+        pfd = uictl_expect.open_node(pointer_node())
     except PermissionError:
         print("SKIP: cannot read %s (need the input group)" % node)
         sys.exit(0)
@@ -425,6 +431,8 @@ try:
 finally:
     if efd is not None:
         os.close(efd)
+    if pfd is not None:
+        os.close(pfd)   # releases the grab; closing is the whole release
     if d is not None:
         d.send_signal(signal.SIGTERM)
         try:
@@ -468,7 +476,7 @@ try:
         sys.exit(0)
 
     node = event_node()
-    efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+    efd = uictl_expect.open_node(node)
     a = conn()
     if hello(a)[0] != OK:
         fail("BB: handshake failed")

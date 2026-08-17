@@ -242,8 +242,8 @@ try:
 
     pnode, knode = uictl_expect.pointer_node(), uictl_expect.keyboard_node()
     try:
-        pfd = os.open(pnode, os.O_RDONLY | os.O_NONBLOCK)
-        kfd = os.open(knode, os.O_RDONLY | os.O_NONBLOCK)
+        pfd = uictl_expect.open_node(pnode)
+        kfd = uictl_expect.open_node(knode)
     except (PermissionError, TypeError):
         print("SKIP: cannot read the event nodes (need the input group)")
         sys.exit(0)

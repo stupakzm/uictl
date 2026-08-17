@@ -147,7 +147,7 @@ try:
         fail("no event node for '%s' in %s" % (DEV_NAME, DEVICES))
         raise SystemExit
     try:
-        efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+        efd = uictl_expect.open_node(node)
     except PermissionError:
         print("SKIP: cannot read %s (need the input group)" % node)
         d.terminate()
@@ -157,7 +157,7 @@ try:
     # pointer (pointer). Reading one and asserting about the other is the
     # mistake the split makes possible, so each case reads its own.
     pnode = pointer_node()
-    pfd = os.open(pnode, os.O_RDONLY | os.O_NONBLOCK) if pnode else None
+    pfd = uictl_expect.open_node(pnode) if pnode else None
     drain(efd, 0.2)                    # discard anything already queued
     if pfd is not None:
         drain(pfd, 0.2)
@@ -248,7 +248,7 @@ else:
         efd = None
         if node:
             try:
-                efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+                efd = uictl_expect.open_node(node)
             except PermissionError:
                 pass
         if efd is None:

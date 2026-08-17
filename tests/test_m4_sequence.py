@@ -139,7 +139,7 @@ try:
     efd = None
     if node:
         try:
-            efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+            efd = uictl_expect.open_node(node)
         except PermissionError:
             pass
     if efd is None:

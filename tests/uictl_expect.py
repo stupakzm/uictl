@@ -126,3 +126,45 @@ def keyboard_node():
 
 def pointer_node():
     return event_node(POINTER_NAME)
+
+
+# ---- opening a node: grab it, always ---------------------------------
+import fcntl as _fcntl
+import os
+
+# EVIOCGRAB = _IOW('E', 0x90, int):
+#   (1 << 30) | (sizeof(int) << 16) | (ord('E') << 8) | 0x90
+EVIOCGRAB = 0x40044590
+
+
+def open_node(path):
+    """Open a uictl event node for reading AND take an exclusive grab.
+
+    The grab is the point. These suites inject for real, into the live
+    session: the virtual devices are indistinguishable from physical
+    ones, which is the product working, and it means every keystroke and
+    click a suite makes is also delivered to whatever has focus. Bounding
+    that by picking "safe" keycodes does not work -- it was tried, and a
+    desktop still found something to do with the survivors.
+
+    EVIOCGRAB is the kernel's answer: while one fd holds the grab, the
+    evdev handler delivers that device's events to that fd and to nobody
+    else. The compositor keeps its own fd open and simply receives
+    nothing, so the suite sees every event it asserts on and the desktop
+    sees none of them. It is released when the fd is closed, including
+    on an abnormal exit, because that is a kernel-side property of the
+    open file description rather than anything the test has to remember.
+
+    Grab the node BEFORE the first injection, or the events in that
+    window still land on the desktop.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        _fcntl.ioctl(fd, EVIOCGRAB, 1)
+    except OSError as e:
+        # EBUSY means something else already holds it. Refuse rather than
+        # continue ungrabbed: a suite that silently degrades to injecting
+        # into the live session is the exact failure this exists to stop.
+        os.close(fd)
+        raise RuntimeError("cannot grab %s: %s" % (path, e))
+    return fd

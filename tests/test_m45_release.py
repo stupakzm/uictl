@@ -176,7 +176,7 @@ try:
         fail("no event node for '%s' in %s" % (DEV_NAME, DEVICES))
         raise SystemExit
     try:
-        efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+        efd = uictl_expect.open_node(node)
     except PermissionError:
         print("SKIP: cannot read %s (need the input group)" % node)
         sys.exit(0)
@@ -328,7 +328,7 @@ try:
         efd = None
         if node:
             try:
-                efd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+                efd = uictl_expect.open_node(node)
             except PermissionError:
                 pass
         c = conn()

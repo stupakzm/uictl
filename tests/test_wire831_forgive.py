@@ -165,8 +165,8 @@ try:
         fail("missing an event node (keyboard=%s pointer=%s)" % (knode, pnode))
         raise SystemExit
     try:
-        kfd = os.open(knode, os.O_RDONLY | os.O_NONBLOCK)
-        pfd = os.open(pnode, os.O_RDONLY | os.O_NONBLOCK)
+        kfd = uictl_expect.open_node(knode)
+        pfd = uictl_expect.open_node(pnode)
     except PermissionError:
         print("SKIP: cannot read the event nodes (need the input group)")
         sys.exit(0)
