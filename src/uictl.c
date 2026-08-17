@@ -44,6 +44,14 @@ static const char *result_name(uint16_t r) {
     return "keycode is not in your policy file";
   case ERR_RATE_LIMITED:
     return "sending faster than your class allows";
+  case ERR_KEY_ALREADY_HELD:
+    return "you already hold that keycode";
+  case ERR_KEY_HELD_BY_OTHER:
+    return "another client is holding that keycode";
+  case ERR_KEY_NOT_HELD:
+    return "you do not hold that keycode";
+  case ERR_TOO_MANY_HELD:
+    return "too many keys held at once";
   default:
     return "unknown result code";
   }
@@ -146,6 +154,48 @@ static void explain(uint16_t result, long detail) {
   case ERR_TOO_LARGE:
     fprintf(stderr, "  why:  the request exceeded the daemon's payload "
                     "limit\n  fix:  send fewer items per request.\n");
+    break;
+  /* The held-state refusals. Three of the four are client bugs, and the
+     advice says so rather than inventing a workaround — a client that
+     has lost track of what it holds cannot be fixed from the outside. */
+  case ERR_KEY_ALREADY_HELD:
+    fprintf(stderr,
+            "  why:  this connection already holds keycode %ld\n"
+            "  fix:  client bug — send the key-up you owe before pressing "
+            "again.\n"
+            "        the daemon does not model auto-repeat; a second "
+            "key-down is\n"
+            "        never what you want.\n",
+            detail);
+    break;
+  case ERR_KEY_HELD_BY_OTHER:
+    fprintf(stderr,
+            "  why:  a different client is holding keycode %ld right now\n"
+            "  fix:  wait and retry — it is mid-gesture, and two clients "
+            "holding one\n"
+            "        key means whoever releases first releases it for both. "
+            "`kill -USR1\n"
+            "        $(pgrep -x uictld)` shows which connection holds what.\n",
+            detail);
+    break;
+  case ERR_KEY_NOT_HELD:
+    fprintf(stderr,
+            "  why:  this connection does not hold keycode %ld\n"
+            "  fix:  none needed — the key is up, which is what you asked "
+            "for. either\n"
+            "        you released it twice, or the daemon's dead-man timer "
+            "already\n"
+            "        force-released it (a hold may not outlive 30s).\n",
+            detail);
+    break;
+  case ERR_TOO_MANY_HELD:
+    fprintf(stderr,
+            "  why:  this connection is already holding the maximum number "
+            "of keys\n"
+            "  fix:  release some. no real gesture needs more than a "
+            "handful down at\n"
+            "        once; if yours does, it probably wants key-combo "
+            "instead.\n");
     break;
   case ERR_INTERNAL:
     fprintf(stderr,
@@ -447,13 +497,19 @@ static int client_hello(int sfd, const char *name, int verbose,
          (caps.device_caps & CAP_KEYBOARD) ? "keyboard " : "",
          (caps.device_caps & CAP_POINTER_REL) ? "pointer-rel " : "",
          (caps.device_caps & CAP_BUTTONS) ? "buttons" : "");
-  printf("  opcodes    %s%s%s%s%s\n",
+  /* key-down/key-up appear here with no matching subcommand below, and
+     that is not an omission. The daemon releases everything a connection
+     holds when it closes, so a one-shot CLI that presses a key and exits
+     has written an elaborate key-tap. They are advertised because
+     long-lived clients — muvor, auto-c — are who they are for. */
+  printf("  opcodes    %s%s%s%s%s%s%s\n",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_PING)) ? "ping " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_MOVE_ABS)) ? "move-abs " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_HELLO)) ? "hello " : "",
          (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_TAP)) ? "key-tap " : "",
-         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_SEQUENCE)) ? "key-seq"
-                                                              : "");
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_SEQUENCE)) ? "key-seq " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_DOWN)) ? "key-down " : "",
+         (caps.opcode_bitmap & UICTL_OP_BIT(OP_KEY_UP)) ? "key-up" : "");
   return 0;
 }
 

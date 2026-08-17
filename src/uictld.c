@@ -39,6 +39,10 @@ static const char *opname(uint16_t op) {
        KEY_TAP and was turned away" is exactly the kind of intent the
        audit log exists to record; "UNKNOWN" would throw it away. */
     return "KEY_TAP";
+  case OP_KEY_DOWN:
+    return "KEY_DOWN";
+  case OP_KEY_UP:
+    return "KEY_UP";
   default:
     return "UNKNOWN";
   }
@@ -530,6 +534,31 @@ static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
 
 enum conn_phase { CONN_WANT_HEADER, CONN_WANT_PAYLOAD };
 
+/* Same keyspace as the allowlist, and the same reasons for a bitset:
+   768 bits is 96 bytes, membership has no ordering to get wrong, and
+   the test is per request. Sized independently of ALLOW_BITS_BYTES on
+   purpose — they happen to be equal because both index keycodes, not
+   because one is derived from the other. */
+#define HELD_BITS_BYTES ((UINPUT_KEY_CODE_MAX / 8) + 1)
+
+/* How many keys one connection may hold at once, and for how long
+   (M4.5 tasks 3 and 4).
+
+   16 is far past any real gesture — a drag is one button, a shortcut is
+   a modifier or three — and it is also UINPUT_SEQ_MAX_EVENTS, so a
+   connection's entire held set always fits in one release frame. That
+   is what makes the disconnect path a single write() no matter what the
+   client did.
+
+   30 seconds is a ceiling, not a target. A human drag finishes in a
+   couple of seconds; a modifier held for half a minute is a wedged
+   client, not a gesture. The cost of being wrong in the generous
+   direction is a client that has to press again; the cost of being
+   wrong in the other direction is Ctrl stuck on the user's desktop with
+   the input broker itself as the wedged component. */
+#define MAX_HELD_PER_CONN 16
+#define HOLD_MAX_SEC 30
+
 /* ---- epoll event keys ------------------------------------------------
    `epoll_event.data` is a union and the obvious choice, `.fd`, is a trap
    here. fd numbers are recycled: the kernel hands out the lowest free
@@ -620,6 +649,35 @@ struct conn {
      G2 is about. accepted_at is CLOCK_MONOTONIC seconds. */
   time_t accepted_at;
   uint64_t frames_served;
+
+  /* --- held state (M4.5 task 1) -------------------------------------
+     Which keycodes this connection currently holds down. Nothing writes
+     to it yet: OP_KEY_DOWN/OP_KEY_UP do not exist, and OP_KEY_SEQUENCE
+     releases everything it presses inside one request, so it never
+     leaves a hold behind. The bookkeeping lands first, exactly as the
+     deny-list landed before injection — there must be no build in which
+     a socket can press a key with no record of who is holding it.
+
+     Owned by the *connection*, not the pid: task 2 has to answer "what
+     does this dying fd hold" while the peer's other connections stay
+     alive, and a pid-keyed set cannot separate them. Task 3's other
+     question — "does anyone else hold this code" — is a 32-slot scan,
+     see conn_holder_of.
+
+     One bitset for keys and buttons together, deliberately: BTN_LEFT is
+     keycode 0x110 and lives in the same keyspace. M5.5 may split the
+     device in two, and splitting this later is mechanical.
+
+     held_since is CLOCK_MONOTONIC seconds at the 0 -> 1 transition, and
+     0 while nothing is held — the *oldest* hold on the connection, not
+     a per-code stamp. Task 4's dead-man timer asks "has this client
+     been holding something too long", which a 768-entry timestamp array
+     per connection would answer more precisely at 6 KB a slot and no
+     practical gain: a drag has a plausible ceiling, and that ceiling is
+     what the timer enforces. */
+  unsigned char held_bits[HELD_BITS_BYTES];
+  int held_count;
+  time_t held_since;
 };
 
 static struct conn conns[MAX_CONNS];
@@ -673,6 +731,14 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     /* Not just [0] = '\0': the whole array is compared and printed, and
        a reused slot must not carry a previous peer's name in its tail. */
     memset(c->client_name, 0, sizeof(c->client_name));
+    /* A reused slot inheriting the previous peer's holds would make the
+       new client unable to press a key it never pressed (task 3 would
+       see it as already held) and would leave task 2 synthesizing a
+       release for someone else's keystroke. conn_close clears this
+       already; clearing it again here is the cheap half of the pair. */
+    memset(c->held_bits, 0, sizeof(c->held_bits));
+    c->held_count = 0;
+    c->held_since = 0;
     return c;
   }
   return NULL; /* table full — caller refuses the connection */
@@ -698,6 +764,223 @@ static int conn_count_pid(pid_t pid) {
     if (conns[i].fd >= 0 && conns[i].cred.pid == pid)
       n++;
   return n;
+}
+
+/* ---- held state accessors (M4.5 task 1) -----------------------------
+   The only three functions that touch held_bits. held_count and
+   held_since are derived state, and derived state maintained at more
+   than one call site drifts: a count that disagrees with the bitset
+   would make task 2 stop synthesizing releases one key early, which
+   presents as a randomly stuck key, hours later, with nothing in the
+   audit log to point at. Everything below goes through these. */
+
+static int conn_holds(const struct conn *c, uint16_t code) {
+  if (code > UINPUT_KEY_CODE_MAX)
+    return 0;
+  return (c->held_bits[code / 8] & (1u << (code % 8))) != 0;
+}
+
+/* Idempotent by construction: a second add of a code already held is a
+   no-op, not a double count. The caller is expected to have refused the
+   duplicate DOWN already (task 3), but a bookkeeping primitive that
+   corrupts its own count when called twice is a landmine. */
+static void conn_hold_add(struct conn *c, uint16_t code) {
+  if (code > UINPUT_KEY_CODE_MAX || conn_holds(c, code))
+    return;
+  c->held_bits[code / 8] |= (unsigned char)(1u << (code % 8));
+  if (c->held_count++ == 0)
+    c->held_since = mono_secs(); /* oldest hold — see the struct comment */
+}
+
+static void conn_hold_drop(struct conn *c, uint16_t code) {
+  if (code > UINPUT_KEY_CODE_MAX || !conn_holds(c, code))
+    return;
+  c->held_bits[code / 8] &= (unsigned char)~(1u << (code % 8));
+  if (--c->held_count == 0)
+    c->held_since = 0;
+}
+
+/* ---- release on disconnect (M4.5 task 2) ----------------------------
+   Emit the release for everything this connection holds, then forget it.
+   This is the safety property the whole milestone exists for: the fd is
+   going away, and the kernel does not care — a key pressed by a process
+   that has since died stays down until something writes value 0 for it.
+   "Something" is only ever this function.
+
+   Called from conn_close, so it covers *every* way a connection ends:
+   clean close, EPOLLHUP, kill -9, reaped stall, epoll registration
+   failure, daemon shutdown. There is deliberately no separate
+   "client disconnected cleanly" path — a clean disconnect is not the
+   case that strands a key, so a fix that only handles it is no fix.
+
+   Reuses uinput_key_seq rather than adding a primitive: it already
+   writes N transitions and exactly one SYN_REPORT in one write(), and
+   it is already verified at the device by tests/test_m4_sequence.py.
+   Chunked at UINPUT_SEQ_MAX_EVENTS because the bitset can hold more
+   codes than one frame carries; releases do not need to be atomic with
+   each other the way a modifier and its key do — each release is
+   independently meaningful, and the requirement is only that all of
+   them happen.
+
+   Descending keycode order: modifiers live low (KEY_LEFTCTRL is 29,
+   KEY_A is 30), so descending releases the ordinary key before the
+   modifier that was held with it. Within one frame the order is
+   cosmetic — one SYN means the compositor sees them together — but
+   across chunks it is real, and "released Ctrl while A was still down"
+   is a state no real keyboard produces.
+
+   Returns the number of codes that could not be written. */
+static int conn_release_held(struct conn *c, int uinput_fd, int audit_fd,
+                             const char *why) {
+  if (c->held_count == 0)
+    return 0; /* the overwhelming majority of closes: no work, no audit */
+
+  const int total = c->held_count;
+  int failed = 0;
+  struct uinput_key_event batch[UINPUT_SEQ_MAX_EVENTS];
+  size_t n = 0;
+
+  /* First few codes, for the audit line. Truncated on purpose: the line
+     has to answer "what came back up" for a human debugging a stuck key,
+     and a 700-code list in a 512-byte record answers nothing. */
+  char list[96];
+  size_t used = 0;
+  int listed = 0;
+
+  for (int code = UINPUT_KEY_CODE_MAX; code >= 1; code--) {
+    if (!conn_holds(c, (uint16_t)code))
+      continue;
+
+    if (listed < 8 && used < sizeof(list) - 1) {
+      int w = snprintf(list + used, sizeof(list) - used, "%s%d",
+                       listed ? "," : "", code);
+      if (w > 0 && (size_t)w < sizeof(list) - used) {
+        used += (size_t)w;
+        listed++;
+      }
+    }
+
+    batch[n].code = (uint16_t)code;
+    batch[n].value = 0;
+    n++;
+    if (n == UINPUT_SEQ_MAX_EVENTS) {
+      if (uinput_key_seq(uinput_fd, batch, n) < 0)
+        failed += (int)n;
+      n = 0;
+    }
+  }
+  if (n > 0 && uinput_key_seq(uinput_fd, batch, n) < 0)
+    failed += (int)n;
+
+  /* Cleared through the one writer, after the writes and regardless of
+     whether they succeeded. Keeping the bits on a failure would look
+     like caution but buys nothing: the connection is being destroyed and
+     the slot reused, so nobody would ever read them again. A write that
+     failed here means the device itself is broken, which is what the
+     ERR_INTERNAL audit line and uinput_key_seq's own stderr are for. */
+  for (int code = UINPUT_KEY_CODE_MAX; code >= 1; code--)
+    conn_hold_drop(c, (uint16_t)code);
+
+  /* One grep-able token, `held-release:`, with the reason as a field —
+     not "release-on-close", which was true of the only caller when this
+     was written and stopped being true one task later when the dead-man
+     timer started calling it too. */
+  char args[256];
+  if (failed)
+    snprintf(args, sizeof(args),
+             "held-release: %d key(s) [%s%s], %d FAILED, reason=%s", total,
+             list, listed < total ? ",..." : "", failed, why);
+  else
+    snprintf(args, sizeof(args), "held-release: %d key(s) [%s%s], reason=%s",
+             total, list, listed < total ? ",..." : "", why);
+
+  /* OP_INVALID with descriptive args, the same shape conn_reap_partial
+     uses: no client asked for this, so echoing an opcode or a seq would
+     invent a request that never existed. Logged unconditionally — a key
+     going up without a client asking is exactly the "intent" security
+     rule 5 wants on the record, and it is the only trace that will exist
+     when someone asks why their Ctrl unstuck itself. */
+  audit_log(audit_fd, c->cred.pid, c->cred.uid, 0, OP_INVALID, 0,
+            failed ? ERR_INTERNAL : OK, args);
+  return failed;
+}
+
+/* Who else currently holds `code` (M4.5 task 3), or NULL.
+
+   A linear scan of 32 slots per DOWN, which is nothing next to the
+   write() that follows. The alternative — a daemon-wide code -> owner
+   table — would be O(1) and would introduce a second copy of the truth
+   that has to be kept in step with 32 bitsets. Task 1's note about
+   derived state applies with more force here: the failure mode of a
+   stale owner table is a key nobody can press again.
+
+   `except` is always the asking connection. Holding a key you already
+   hold is a different error from someone else holding it (client bug vs
+   contention), so the two questions are answered separately. */
+static struct conn *conn_holder_of(uint16_t code, const struct conn *self) {
+  for (int i = 0; i < MAX_CONNS; i++) {
+    if (conns[i].fd < 0 || &conns[i] == self)
+      continue;
+    if (conn_holds(&conns[i], code))
+      return &conns[i];
+  }
+  return NULL;
+}
+
+/* Startup selftest, in the house style of uinput_denylist_selftest():
+   prove the bit math on the boundaries rather than trust it. An
+   off-by-one in the byte/shift arithmetic is the classic bug here, and
+   its symptom — one keycode that can be pressed but never released, or
+   a hold recorded against the neighbouring code — would surface as a
+   stuck key long after the cause. Runs on a scratch connection so it
+   cannot disturb the live table. Returns non-zero to refuse startup. */
+static int conn_held_selftest(void) {
+  static struct conn probe; /* static: 96 B + buffers, too big for stack */
+  int bad = 0;
+
+  const uint16_t edges[] = {1, 7, 8, 272 /* BTN_LEFT */,
+                            UINPUT_KEY_CODE_MAX - 1, UINPUT_KEY_CODE_MAX};
+  for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+    uint16_t code = edges[i];
+    conn_hold_add(&probe, code);
+    if (!conn_holds(&probe, code)) {
+      fprintf(stderr, "uictld: held selftest: %u did not set\n", code);
+      bad = 1;
+    }
+    /* The neighbours must be untouched — this is the check that catches
+       a shift applied to the wrong byte. */
+    if ((code > 1 && conn_holds(&probe, (uint16_t)(code - 1))) ||
+        (code < UINPUT_KEY_CODE_MAX && conn_holds(&probe, (uint16_t)(code + 1)))) {
+      fprintf(stderr, "uictld: held selftest: %u bled into a neighbour\n", code);
+      bad = 1;
+    }
+    conn_hold_add(&probe, code); /* idempotence: must not double count */
+    if (probe.held_count != 1) {
+      fprintf(stderr, "uictld: held selftest: %u count=%d, want 1\n", code,
+              probe.held_count);
+      bad = 1;
+    }
+    if (probe.held_since == 0) {
+      fprintf(stderr, "uictld: held selftest: %u left held_since unset\n", code);
+      bad = 1;
+    }
+    conn_hold_drop(&probe, code);
+    conn_hold_drop(&probe, code); /* dropping twice must not go negative */
+    if (conn_holds(&probe, code) || probe.held_count != 0 ||
+        probe.held_since != 0) {
+      fprintf(stderr, "uictld: held selftest: %u did not clear (count=%d)\n",
+              code, probe.held_count);
+      bad = 1;
+    }
+  }
+
+  /* Out of range must be refused, not wrapped into some other byte. */
+  conn_hold_add(&probe, (uint16_t)(UINPUT_KEY_CODE_MAX + 1));
+  if (probe.held_count != 0) {
+    fprintf(stderr, "uictld: held selftest: out-of-range code was recorded\n");
+    bad = 1;
+  }
+  return bad;
 }
 
 /* ---- rate limiting (M4 step 10) -------------------------------------
@@ -878,9 +1161,20 @@ static struct conn *conn_from_evkey(uint64_t key) {
   return c;
 }
 
-static void conn_close(int epfd, struct conn *c) {
+/* uinput_fd and audit_fd are threaded in rather than kept at file scope
+   precisely so this is not easy to forget: a new close path does not
+   compile until its author has said where the releases go. That is worth
+   more than the noise, because a close path that skips the release is
+   invisible at runtime until the day a client dies holding Ctrl. */
+static void conn_close(int epfd, struct conn *c, int uinput_fd, int audit_fd) {
   if (!c || c->fd < 0)
     return;
+
+  /* Before the fd goes away, and before the epoll deregistration — the
+     order does not matter to the kernel device, but doing it first means
+     no early return can ever be added above it. */
+  conn_release_held(c, uinput_fd, audit_fd, "connection closed");
+
   epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
   close(c->fd);
   c->fd = -1;
@@ -896,6 +1190,15 @@ static void conn_close(int epfd, struct conn *c) {
   c->out_sent = 0;
   c->out_since = 0;
   c->events = 0;
+
+  /* conn_release_held above already emptied the set through its own
+     accessor. This is the belt to that braces: if it somehow did not,
+     the slot must still not be handed to the next peer carrying a
+     previous client's holds, which would make task 3 refuse keys the new
+     client never pressed. */
+  memset(c->held_bits, 0, sizeof(c->held_bits));
+  c->held_count = 0;
+  c->held_since = 0;
 }
 
 /* Best-effort refusal for a peer that never becomes a conn (bad uid,
@@ -1014,38 +1317,40 @@ static int conn_update_events(int epfd, struct conn *c) {
 /* Common tail for "we just staged (and tried to send) a response".
    Returns 0 if the connection survives and may keep parsing, -1 if it
    was closed. */
-static int conn_after_flush(int epfd, struct conn *c, int flushed) {
+static int conn_after_flush(int epfd, struct conn *c, int flushed,
+                            int uinput_fd, int audit_fd) {
   if (flushed < 0) { /* dead socket */
-    conn_close(epfd, c);
+    conn_close(epfd, c, uinput_fd, audit_fd);
     return -1;
   }
   if (flushed > 0) { /* still queued: wait for EPOLLOUT */
     if (c->out_since == 0)
       c->out_since = mono_secs(); /* start the stall clock */
     if (conn_update_events(epfd, c) < 0) {
-      conn_close(epfd, c);
+      conn_close(epfd, c, uinput_fd, audit_fd);
       return -1;
     }
     return -1; /* survives, but the caller must stop reading */
   }
   if (c->close_after_flush) { /* fatal frame, reply delivered */
-    conn_close(epfd, c);
+    conn_close(epfd, c, uinput_fd, audit_fd);
     return -1;
   }
   return 0;
 }
 
 /* The peer drained enough of its receive buffer for us to continue. */
-static void conn_writable(int epfd, struct conn *c) {
+static void conn_writable(int epfd, struct conn *c, int uinput_fd,
+                          int audit_fd) {
   int flushed = conn_flush(c);
   if (flushed < 0) {
-    conn_close(epfd, c);
+    conn_close(epfd, c, uinput_fd, audit_fd);
     return;
   }
   if (flushed > 0)
     return; /* still not drained; EPOLLOUT stays armed */
   if (c->close_after_flush) {
-    conn_close(epfd, c);
+    conn_close(epfd, c, uinput_fd, audit_fd);
     return;
   }
   /* Re-arm EPOLLIN. We do NOT call conn_readable here: if the peer
@@ -1054,7 +1359,7 @@ static void conn_writable(int epfd, struct conn *c) {
      EPOLLIN on the very next epoll_wait. Letting the loop do it keeps
      this function from recursing into the parser. */
   if (conn_update_events(epfd, c) < 0)
-    conn_close(epfd, c);
+    conn_close(epfd, c, uinput_fd, audit_fd);
 }
 
 /* One complete, size-validated frame is in c->hdr + c->buf. */
@@ -1103,9 +1408,15 @@ static struct uictl_resp_hello daemon_capabilities(uint16_t proto_selected) {
       /* OP_KEY_TAP joins the map in M4 step 7 and not before: the bitmap
          is the contract, and it may only advertise what is fully wired —
          validated, gated by the deny-list, and actually injected. */
+      /* KEY_DOWN/KEY_UP join in M4.5 task 3, and only because tasks 1,
+         2 and 4 are in the same build: ownership recorded, released on
+         every way a connection can end, and force-released if a live
+         client holds too long. Advertising a way to hold a key without
+         all three would be advertising a stuck key. */
       .opcode_bitmap = UICTL_OP_BIT(OP_PING) | UICTL_OP_BIT(OP_MOVE_ABS) |
                        UICTL_OP_BIT(OP_HELLO) | UICTL_OP_BIT(OP_KEY_TAP) |
-                       UICTL_OP_BIT(OP_KEY_SEQUENCE),
+                       UICTL_OP_BIT(OP_KEY_SEQUENCE) |
+                       UICTL_OP_BIT(OP_KEY_DOWN) | UICTL_OP_BIT(OP_KEY_UP),
       .daemon_version = UICTL_DAEMON_VERSION,
       .reserved = 0,
   };
@@ -1185,8 +1496,16 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
      daemon with malformed frames is still hammering it, and a limiter
      that only counts well-formed requests does not limit the case you
      most want limited. */
+  /* OP_KEY_UP is NOT in this set, and that is a safety decision rather
+     than a generosity. A client that has spent its budget holding keys
+     down must still be able to put them back up; charging the release
+     means the way to get a stuck key is to be slightly too fast. Same
+     shape as the PING/HELLO exemption — never make the escape hatch
+     depend on the resource that ran out. OP_KEY_DOWN *is* charged: it is
+     a device write like any other, and it is the half a client can be
+     told to slow down without consequence. */
   if (c->hdr.opcode == OP_MOVE_ABS || c->hdr.opcode == OP_KEY_TAP ||
-      c->hdr.opcode == OP_KEY_SEQUENCE) {
+      c->hdr.opcode == OP_KEY_DOWN || c->hdr.opcode == OP_KEY_SEQUENCE) {
     unsigned cost = 1;
     if (c->hdr.opcode == OP_KEY_SEQUENCE &&
         c->hdr.payload_len >= sizeof(struct uictl_payload_key_seq)) {
@@ -1427,6 +1746,138 @@ static void conn_handle_frame(struct conn *c, int uinput_fd, int audit_fd) {
     result = (uinput_key_tap(uinput_fd, key.keycode) < 0) ? ERR_INTERNAL : OK;
     break;
   }
+  case OP_KEY_DOWN: {
+    /* Same gate as KEY_TAP — size, range, deny-list, allowlist — and
+       then the part that is new in M4.5: arbitration. The order is not
+       arbitrary. Policy first, so a destructive key is refused for being
+       destructive rather than for being busy; ownership last, because it
+       is the only check whose answer depends on other clients and can
+       change between two identical requests. */
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_key)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_key key;
+    decode_key(c->buf, &key);
+
+    if (key.keycode == 0 || key.keycode > UINPUT_KEY_CODE_MAX) {
+      snprintf(args, sizeof(args), "code=%u out of range", key.keycode);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    const char *why = NULL;
+    if (uinput_keycode_denied(key.keycode, &why)) {
+      snprintf(args, sizeof(args), "code=%u denied (%s)", key.keycode, why);
+      result = ERR_KEY_DENYLISTED;
+      break;
+    }
+    if (!key_allowed(key.keycode)) {
+      snprintf(args, sizeof(args), "code=%u not in allowlist", key.keycode);
+      result = ERR_KEY_NOT_ALLOWED;
+      break;
+    }
+
+    /* Arbitration, three questions in the order that gives the most
+       specific answer first. */
+    if (conn_holds(c, key.keycode)) {
+      /* Not idempotent-on-purpose. Silently acking would leave the
+         client believing it holds one key while owing one UP, and the
+         accounting error surfaces later as a key that will not press. A
+         real keyboard's repeat is EV_KEY value 2, a different thing that
+         this protocol does not model. */
+      snprintf(args, sizeof(args), "code=%u already held by this connection",
+               key.keycode);
+      result = ERR_KEY_ALREADY_HELD;
+      break;
+    }
+    struct conn *owner = conn_holder_of(key.keycode, c);
+    if (owner) {
+      /* The audit line names the other peer; the client is told only
+         that someone else holds it. Which pid is a fact about a
+         different process of the same user, and open question 4 leans
+         against handing peer identities to clients — the operator gets
+         it via the audit log and SIGUSR1 instead. */
+      snprintf(args, sizeof(args), "code=%u held by pid=%d (%s)", key.keycode,
+               (int)owner->cred.pid,
+               owner->hello_seen ? owner->client_name : "-");
+      result = ERR_KEY_HELD_BY_OTHER;
+      break;
+    }
+    if (c->held_count >= MAX_HELD_PER_CONN) {
+      snprintf(args, sizeof(args), "code=%u refused, already holding %d",
+               key.keycode, c->held_count);
+      result = ERR_TOO_MANY_HELD;
+      break;
+    }
+
+    /* Press, then record — never the other way round. If the write
+       fails there is nothing held, and a bitset that says otherwise
+       would make the connection's release-on-close emit an UP for a key
+       that was never down. The reverse ordering is also what makes the
+       failure safe: a recorded hold with no press is invisible until it
+       produces a spurious release. */
+    struct uinput_key_event down = {.code = key.keycode, .value = 1};
+    if (uinput_key_seq(uinput_fd, &down, 1) < 0) {
+      snprintf(args, sizeof(args), "code=%u write failed", key.keycode);
+      result = ERR_INTERNAL;
+      break;
+    }
+    conn_hold_add(c, key.keycode);
+    snprintf(args, sizeof(args), "code=%u held (%d total)", key.keycode,
+             c->held_count);
+    result = OK;
+    break;
+  }
+  case OP_KEY_UP: {
+    /* The release path is deliberately the thinnest gate in the daemon:
+       size, range, "do you hold it", write. No deny-list, no allowlist,
+       no rate limit (see the exemption where the bucket is charged).
+
+       That is not an oversight, it is the invariant. Every one of those
+       checks can say no, and a no here means a key stays down. Policy
+       already had its say on the DOWN — nothing can be held that was not
+       allowed — so re-asking on the way up can only ever produce a stuck
+       key, never prevent one. */
+    if (c->hdr.payload_len != sizeof(struct uictl_payload_key)) {
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    struct uictl_payload_key key;
+    decode_key(c->buf, &key);
+
+    if (key.keycode == 0 || key.keycode > UINPUT_KEY_CODE_MAX) {
+      snprintf(args, sizeof(args), "code=%u out of range", key.keycode);
+      result = ERR_PAYLOAD_INVALID;
+      break;
+    }
+    if (!conn_holds(c, key.keycode)) {
+      /* Includes the case where the dead-man timer already released it.
+         Reported, not silently OK'd: a client that is releasing keys it
+         does not hold has lost track of its own state, and that is worth
+         knowing even though the outcome it wanted (key is up) is true. */
+      snprintf(args, sizeof(args), "code=%u not held by this connection",
+               key.keycode);
+      result = ERR_KEY_NOT_HELD;
+      break;
+    }
+
+    /* Clear the bookkeeping first here — the mirror image of DOWN, and
+       for the same reason. If the write fails the key may well be stuck
+       at the device, but keeping the bit set would only add a second,
+       identical failed write on disconnect. The ERR_INTERNAL and
+       uinput's own stderr are the report; the bit is not a retry queue. */
+    struct uinput_key_event up = {.code = key.keycode, .value = 0};
+    conn_hold_drop(c, key.keycode);
+    if (uinput_key_seq(uinput_fd, &up, 1) < 0) {
+      snprintf(args, sizeof(args), "code=%u write failed", key.keycode);
+      result = ERR_INTERNAL;
+      break;
+    }
+    snprintf(args, sizeof(args), "code=%u released (%d still held)",
+             key.keycode, c->held_count);
+    result = OK;
+    break;
+  }
   case OP_KEY_SEQUENCE: {
     /* Same gate order as KEY_TAP, applied to every item before ANY of
        them is written: size, range, deny-list, allowlist, balance — then
@@ -1595,11 +2046,11 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
         if (errno == EAGAIN || errno == EWOULDBLOCK)
           return; /* socket drained; wait for the next EPOLLIN */
         perror("uictld: read client");
-        conn_close(epfd, c);
+        conn_close(epfd, c, uinput_fd, audit_fd);
         return;
       }
       if (r == 0) { /* peer EOF */
-        conn_close(epfd, c);
+        conn_close(epfd, c, uinput_fd, audit_fd);
         return;
       }
       if (c->have == 0 && c->phase == CONN_WANT_HEADER)
@@ -1636,7 +2087,7 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
            closed immediately; if it didn't drain, the client learned
            nothing but "connection reset". */
         c->close_after_flush = 1;
-        (void)conn_after_flush(epfd, c, conn_flush(c));
+        (void)conn_after_flush(epfd, c, conn_flush(c), uinput_fd, audit_fd);
         return;
       }
 
@@ -1665,7 +2116,7 @@ static void conn_readable(int epfd, struct conn *c, int uinput_fd,
     /* -1 means closed, or queued and waiting on EPOLLOUT. Either way we
        stop parsing: with one out buffer, handling the next pipelined
        frame here would clobber the reply still in flight. */
-    if (conn_after_flush(epfd, c, flushed) < 0)
+    if (conn_after_flush(epfd, c, flushed, uinput_fd, audit_fd) < 0)
       return;
 
     /* Counted here, per *dispatched frame* — not per read() and not per
@@ -1695,12 +2146,37 @@ static int conn_frame_in_progress(const struct conn *c) {
 /* One timer, scanned against the whole table — not one timer per
    connection. At <= 32 slots the scan is cheaper than 32 timerfds, and
    there is no per-connection fd to leak on close. */
-static void conn_reap_partial(int epfd, int audit_fd) {
+static void conn_reap_partial(int epfd, int uinput_fd, int audit_fd) {
   time_t now = mono_secs();
   for (int i = 0; i < MAX_CONNS; i++) {
     struct conn *c = &conns[i];
     if (c->fd < 0)
       continue;
+
+    /* Dead-man timer (M4.5 task 4). The connection is alive and may be
+       perfectly healthy — this is the one case task 2 cannot reach,
+       because nothing is disconnecting. A client that is up but stuck
+       between its DOWN and its UP holds a key on the user's desktop
+       indefinitely, and "the client will get to it" is not a property
+       the broker can assert about code it does not own.
+
+       Released, not reaped: the connection did nothing wrong at the
+       protocol level and its next request should work. It will meet
+       ERR_KEY_NOT_HELD on the UP it eventually sends, which is exactly
+       the signal that its held set and the daemon's have diverged.
+
+       held_since is the connection's *oldest* hold (task 1), so the
+       quantity bounded here is "this connection has been continuously
+       holding something for HOLD_MAX_SEC", not the age of any one key.
+       That is the more meaningful thing to bound — and it means a
+       client that keeps one key down while tapping others is correctly
+       seen as stuck rather than busy. Everything it holds goes up
+       together: a partial release would leave it holding a set neither
+       side agrees on. */
+    if (c->held_count > 0 && now - c->held_since >= HOLD_MAX_SEC) {
+      conn_release_held(c, uinput_fd, audit_fd, "dead-man timer");
+      /* fall through: this connection may also be stalled */
+    }
 
     /* Two independent stalls, same deadline.
 
@@ -1734,7 +2210,7 @@ static void conn_reap_partial(int epfd, int audit_fd) {
     /* No reply attempt. The peer is by definition not talking, so its
        receive window may be full and a write could block the daemon —
        which is exactly the failure this whole milestone removes. */
-    conn_close(epfd, c);
+    conn_close(epfd, c, uinput_fd, audit_fd);
   }
 }
 
@@ -1784,21 +2260,34 @@ static void conn_dump_table(void) {
       if (rate_buckets[b].used && rate_buckets[b].pid == c->cred.pid)
         tokens = rate_buckets[b].milli / RATE_UNIT;
 
+    /* held=N(age) is the column an operator reaches for when something
+       is stuck down: it names the connection to kill and says how long
+       it has been that way. Reads held=0 everywhere until task 3. */
     fprintf(stderr,
             "  slot=%2d gen=%u fd=%d pid=%d uid=%u name=%s class=%s "
             "tokens=%u/%u phase=%s(%zu/%zu) reply=%zu/%zu age=%llds "
-            "frames=%llu\n",
+            "frames=%llu held=%d(%llds)\n",
             i, c->generation, c->fd, (int)c->cred.pid, (unsigned)c->cred.uid,
             c->hello_seen ? c->client_name : "-", class_name(c->cl), tokens,
             rate_classes[c->cl].burst, phase,
             c->have, c->want,
             c->out_sent, c->out_len, (long long)(now - c->accepted_at),
-            (unsigned long long)c->frames_served);
+            (unsigned long long)c->frames_served, c->held_count,
+            c->held_since ? (long long)(now - c->held_since) : 0LL);
   }
   fflush(stderr);
 }
 
 int main(void) {
+
+  /* First thing, before any fd exists: a pure-logic check with nothing
+     to unwind on failure. Same posture as uinput_denylist_selftest() —
+     a daemon whose held-state bookkeeping is wrong must not start, since
+     the failure it produces is a key stuck down on the user's desktop. */
+  if (conn_held_selftest() != 0) {
+    fprintf(stderr, "uictld: held-state selftest failed, refusing to start\n");
+    return 1;
+  }
 
   const char *xdg = getenv("XDG_RUNTIME_DIR");
   if (!xdg) {
@@ -2067,7 +2556,7 @@ int main(void) {
             perror("uictld: read timerfd");
           continue;
         }
-        conn_reap_partial(epfd, audit_fd);
+        conn_reap_partial(epfd, uinput_fd, audit_fd);
       } else if (is_static && skey == sfd) {
         /* Accept until EAGAIN: one EPOLLIN on the listening socket can
            stand for several queued connections, and level-triggered
@@ -2130,7 +2619,7 @@ int main(void) {
                                     .data.u64 = conn_evkey(c)};
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
             perror("uictld: epoll_ctl ADD client");
-            conn_close(epfd, c);
+            conn_close(epfd, c, uinput_fd, audit_fd);
             continue;
           }
         }
@@ -2139,14 +2628,14 @@ int main(void) {
         if (!c)
           continue; /* connection closed earlier in this same batch */
         if (events[i].events & (EPOLLHUP | EPOLLERR)) {
-          conn_close(epfd, c);
+          conn_close(epfd, c, uinput_fd, audit_fd);
           continue;
         }
         /* Only ever one of the two is registered at a time (see
            conn_update_events), but check both and re-test c->fd:
            conn_writable can close the connection out from under us. */
         if (events[i].events & EPOLLOUT)
-          conn_writable(epfd, c);
+          conn_writable(epfd, c, uinput_fd, audit_fd);
         if (c->fd >= 0 && (events[i].events & EPOLLIN))
           conn_readable(epfd, c, uinput_fd, audit_fd);
       }
@@ -2159,7 +2648,7 @@ int main(void) {
      blocked in read() sees EOF rather than a silently vanished daemon. */
   for (int i = 0; i < MAX_CONNS; i++)
     if (conns[i].fd >= 0)
-      conn_close(epfd, &conns[i]);
+      conn_close(epfd, &conns[i], uinput_fd, audit_fd);
 
   uinput_close(uinput_fd);
   close(tfd);

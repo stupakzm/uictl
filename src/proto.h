@@ -45,7 +45,28 @@ enum uictl_op {
   OP_MOVE_ABS,
   OP_HELLO,
   OP_KEY_TAP,
-  OP_KEY_SEQUENCE
+  OP_KEY_SEQUENCE,
+
+  /* M4 step 9, unblocked by M4.5. These are the only opcodes that leave
+     kernel state behind when the request finishes, which is why they
+     waited for the machinery that guarantees it comes back:
+     per-connection ownership (task 1), a synthesized release on every
+     way a connection can end (task 2), arbitration between connections
+     (task 3), and a dead-man timer for a client that is alive but stuck
+     (task 4). Shipping them earlier would have meant a socket could
+     press a key with nothing able to promise it would ever come up.
+
+     Both take struct uictl_payload_key — the same 2-byte payload as
+     OP_KEY_TAP, because the question ("which key?") is the same.
+
+     A one-shot client has no use for these: the release fires when its
+     connection closes, so `key-down` from a CLI that then exits is an
+     elaborate way to write KEY_TAP. They exist for long-lived clients
+     that need a key held *across* other requests — drag, modifier+move
+     — which is exactly what OP_KEY_SEQUENCE deliberately cannot
+     express. */
+  OP_KEY_DOWN,
+  OP_KEY_UP
 };
 
 /* Result codes are ON THE WIRE. Append only — never insert, never
@@ -62,7 +83,14 @@ enum uictl_op {
                    local configuration makes it work.
                    ERR_KEY_NOT_ALLOWED: add the keycode to
                    ~/.config/uictl/policy and restart the daemon.
-     retryable   — the daemon is momentarily out of room. ERR_BUSY only.
+     retryable   — the daemon is momentarily out of room, or another
+                   connection is mid-gesture. ERR_BUSY,
+                   ERR_KEY_HELD_BY_OTHER, ERR_RATE_LIMITED (after a
+                   wait — see its note).
+     client bug  — the request contradicts state the client itself
+                   established. ERR_KEY_ALREADY_HELD, ERR_KEY_NOT_HELD,
+                   ERR_TOO_MANY_HELD. Retrying identically fails; the
+                   client has to reconcile its own held set first.
      correctable — the request was fine, the connection wasn't ready.
                    ERR_HANDSHAKE_REQUIRED: send OP_HELLO on this same
                    connection and the retry succeeds.
@@ -104,7 +132,44 @@ enum uictl_result {
      A library that conflated them would answer a rate limit with a
      retry storm, which is the one response guaranteed to make it
      worse. Retryable, after a wait. */
-  ERR_RATE_LIMITED
+  ERR_RATE_LIMITED,
+
+  /* Held-state arbitration (M4.5 task 3). Three codes and not one,
+     because the right response differs in each case and a client that
+     cannot tell them apart can only give up:
+
+       ERR_KEY_ALREADY_HELD  — *you* hold this key. Client bug: you lost
+                               track of your own state. Retrying will
+                               fail identically; the fix is to send the
+                               UP you owe, or to stop sending the
+                               duplicate DOWN.
+       ERR_KEY_HELD_BY_OTHER — another connection holds it. Nothing
+                               about this request was wrong and it may
+                               well succeed later. Retryable, after a
+                               wait — but back off, because the other
+                               client is mid-gesture.
+       ERR_KEY_NOT_HELD      — an UP for a key this connection does not
+                               hold. Client bug, and usually a benign
+                               one: the daemon may have force-released
+                               it (dead-man timer) or the client is
+                               double-releasing. Terminal for this
+                               request; the key is up either way, which
+                               is what the client wanted.
+
+     Note what is deliberately absent: there is no code for "an UP was
+     refused by policy". A client that holds a key must ALWAYS be able
+     to release it, so the release path is not policy-gated and not
+     rate-limited. Any refusal of an UP is a stuck key. */
+  ERR_KEY_ALREADY_HELD,
+  ERR_KEY_HELD_BY_OTHER,
+  ERR_KEY_NOT_HELD,
+
+  /* Too many keys held at once on one connection. A bound on untrusted
+     input, in the same spirit as the payload cap: no real gesture needs
+     more than a handful of keys down, and the bound keeps the
+     synthesized release burst on disconnect small and predictable.
+     Fixable by the client releasing what it holds. */
+  ERR_TOO_MANY_HELD
 };
 
 /* ---- source_tag: ADVISORY METADATA ONLY (M3.6 task 6) ---------------
