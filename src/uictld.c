@@ -1911,6 +1911,37 @@ static struct conn *confirmer_conn(void) {
    from the wire is validated by the dispatch switch below — reaching
    here it simply falls through to 0, which is safe because a frame that
    is not a known opcode never executes anything. */
+/* Is this request a RELEASE of something already held?
+
+   WIRE.md §6.3: the release path is never refused for a policy reason,
+   because policy already had its say on the press — nothing can be held
+   that was not allowed — so re-asking on the way up can only ever create
+   a stuck key, never prevent one.
+
+   The rate limiter got this right from M4 and exempts the same two
+   cases. The confirmation gate did not: until this was written, a
+   flagged client's OP_KEY_UP was parked for a human, and a denial, a
+   timeout, or a missing confirmer left the key DOWN. Every one of those
+   is a normal outcome of the confirmation flow — it fails closed by
+   design — so the gate turned "the user said no" into a stuck modifier
+   that only the 30-second dead-man timer would clear.
+
+   Payload-aware, not opcode-aware, because OP_BUTTON carries both
+   directions in one opcode. Same reason the rate limiter reads the
+   buffer here rather than switching on the opcode alone. A malformed
+   payload is NOT treated as a release: it falls through to the gate and
+   then to the size check, so a client cannot dodge confirmation by
+   sending a short frame. */
+static int op_is_release(const struct conn *c) {
+  if (c->hdr.opcode == OP_KEY_UP)
+    return 1;
+  if (c->hdr.opcode == OP_BUTTON &&
+      c->hdr.payload_len == sizeof(struct uictl_payload_button))
+    return ((const struct uictl_payload_button *)(const void *)c->buf)->down ==
+           0;
+  return 0;
+}
+
 static int op_touches_device(uint16_t op) {
   switch ((enum uictl_op)op) {
   case OP_MOVE_ABS:
@@ -2276,7 +2307,7 @@ static void conn_handle_frame(int epfd, struct conn *c, const struct uinput_devs
      which the client writes itself — the LLM agent would simply not set
      the bit. That is G2, and proto.h names a confirmation prompt as one
      of the things that must never read that field. */
-  if (!resumed && op_touches_device(c->hdr.opcode) &&
+  if (!resumed && op_touches_device(c->hdr.opcode) && !op_is_release(c) &&
       (c->roles & ROLE_CONFIRM)) {
     uint16_t parked = confirm_park(epfd, c);
     if (parked == OK) {

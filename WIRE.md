@@ -25,7 +25,7 @@ decisions but is checked by the compiler.
 | 4 | Result codes and response classes | *not yet written* |
 | 5A | **Opcodes — the pointer** | **normative** |
 | 5B | Opcodes — the keyboard, and `BATCH` | *not yet written* |
-| 6 | Held state | *not yet written* |
+| 6 | **Held state** | **normative** |
 | 7 | Confirmation | *not yet written* |
 | 8 | **Connection lifecycle and restart** | **normative** |
 | 9 | Conformance vectors | *not yet written* |
@@ -297,6 +297,196 @@ If the connection drops anywhere in that sequence, §8 applies in full:
 the button is released by the daemon, the client's held set is empty,
 nothing is replayed, and the next connection starts with a fresh
 `HELLO`.
+
+---
+
+# 6. Held state
+
+Most opcodes finish where they started: the request is validated, an
+event frame goes to the device, the response comes back, and nothing
+remains. Four do not. `BUTTON` with `down = 1` (§5A.4) and `KEY_DOWN`
+(§5B) leave a key or button **physically down** on a virtual device that
+the compositor believes is real hardware, and `BUTTON` with `down = 0`
+and `KEY_UP` are how it comes back up.
+
+That asymmetry is the whole subject of this section, and it is why these
+opcodes shipped a milestone after the rest: **a protocol that can press
+a key must guarantee the key comes back up, including when the client
+that pressed it stops existing.** Everything below is that guarantee.
+
+## 6.1 The hold set
+
+Every connection owns a set of the codes it currently holds. A code is
+in exactly one connection's set or in none.
+
+- **Keys and buttons share one set.** `BTN_LEFT` is keycode 272 and
+  lives in the same numeric space as `KEY_A`, so the set is indexed by
+  keycode over `0 .. 767` (`KEY_MAX`) rather than by any count of keys.
+  Everything in this section therefore applies to buttons and keys
+  identically, and where §5A referred here for `BUTTON`, this is what it
+  meant.
+- **It is owned by the connection, not the process.** A peer with four
+  connections has four independent hold sets, and closing one releases
+  only what that one held. Keying it on the pid could not answer the
+  question the release path actually asks — "what does *this* dying file
+  descriptor hold" — while the peer's other connections stay alive.
+- **It does not survive the connection** (§8.2), and nothing resumes it.
+
+### 6.1.1 The cap
+
+A connection may hold at most **16** codes at once. The 17th returns
+`ERR_TOO_MANY_HELD`, and the refusal disturbs nothing already held.
+
+The bound exists for two reasons, and the second is the load-bearing
+one. No real gesture needs more than a handful of codes down, so it is a
+cheap bound on untrusted input in the same spirit as the payload cap.
+More importantly it keeps the **synthesized release burst small and
+predictable**: whatever the daemon has to emit when a connection dies is
+bounded by this number, so the release path has a known worst case
+rather than one that scales with how badly a client misbehaved.
+
+The cap is on the shared set, not per device. Twelve held keys and four
+held buttons is sixteen.
+
+## 6.2 One holder per code
+
+A code may be held by at most one connection at a time, across the whole
+daemon.
+
+- A press for a code **this** connection already holds →
+  `ERR_KEY_ALREADY_HELD`. This is a client bug: the client lost track of
+  its own state. Retrying identically fails; the fix is to send the
+  release it owes, or to stop sending the duplicate press.
+- A press for a code **another** connection holds →
+  `ERR_KEY_HELD_BY_OTHER`. Nothing about the request was wrong and it
+  may well succeed shortly. Retryable — but a client SHOULD back off,
+  because the holder is by definition mid-gesture.
+
+The two are separate codes rather than one refusal because the right
+response differs completely, and a client that cannot tell them apart
+can only give up. One says "fix your bookkeeping"; the other says "wait".
+
+The motivating case is concrete: two clients dragging with `BTN_LEFT` at
+the same time. Without arbitration, whichever releases first releases it
+for both, and the other client is left in a drag that never ends and
+that it has no way to notice.
+
+## 6.3 A release is never refused for a policy reason
+
+**The release path is the thinnest gate in the daemon**: payload size,
+range, "do you hold it", write. In particular it is:
+
+- **not rate limited.** `KEY_DOWN` and `BUTTON` down are charged against
+  the client's budget; `KEY_UP` and `BUTTON` up are not.
+- **not subject to the key allowlist or the deny-list.**
+- **not subject to confirmation** (§7).
+
+This is a safety property, not a generosity, and it follows from one
+observation: **policy already had its say on the press.** Nothing can be
+held that was not allowed through the full gate. Re-asking any of those
+questions on the way up can therefore only ever *create* a stuck key —
+never prevent one.
+
+Stated as a rule for implementers: **never make the escape hatch depend
+on the resource that ran out.** A client that spent its budget holding
+keys down must still be able to put them up; charging the release means
+the way to produce a stuck key is to be slightly too fast. The same
+shape exempts `PING` and `HELLO` from the rate limit, so that a
+throttled client can still ask why it is being throttled.
+
+There is deliberately **no result code for "the release was refused by
+policy"**. Any such code would be a stuck key with a number attached.
+
+The one refusal a release can produce is `ERR_KEY_NOT_HELD`, which is
+bookkeeping rather than policy — and §8.3.1 forgives even that on a
+connection that has never held anything.
+
+## 6.4 Everything comes back up. Four independent guarantees.
+
+The client is not trusted to release what it holds. It usually will;
+these exist for when it does not.
+
+### 6.4.1 Release on disconnect
+
+When a connection ends by **any** means — orderly close, `close()`
+without warning, client crash, `SIGKILL`, daemon shutdown, admission
+eviction, the reaper, the dead-man timer — the daemon synthesizes a
+release for everything that connection holds. §8.3 states this from the
+client's side; here is what it does.
+
+**Codes are released in descending order.** That is not cosmetic. A
+modifier has a low keycode (`KEY_LEFTCTRL` is 29) and the key it
+modifies is usually higher, so descending order releases the modified
+key *before* the modifier — the order a human's hand uses, and the order
+a compositor's key-repeat and shortcut matching expect. Releasing Ctrl
+first can turn the trailing release into a different chord.
+
+**Releases are routed per device.** A held button is released on the
+pointer device and a held key on the keyboard. Releasing one through the
+other writes an event the kernel silently drops, producing a stuck
+button that the release path *believes* it released — worse than never
+having tried, because nothing reports it.
+
+**The set is cleared whether or not the writes succeeded.** A failed
+write here means the device itself is broken, which the audit line
+records; keeping the bits would look like caution but buys nothing,
+since the connection is being destroyed and the slot reused.
+
+### 6.4.2 The dead-man timer
+
+A client can be perfectly alive and still stuck — an infinite loop after
+`KEY_DOWN`, a deadlock, a debugger breakpoint. Its connection is open,
+it is answering nothing, and none of §6.4.1 applies.
+
+So: a connection that has been **continuously holding something for 30
+seconds** has everything force-released.
+
+The quantity bounded is the age of the connection's *oldest* hold, not
+of any individual code. That is deliberate and it has a consequence
+worth stating: a client that keeps one key down while tapping others is
+correctly seen as stuck rather than busy. Everything goes up together —
+a partial release would leave the client holding a set that neither side
+agrees on, which is the divergence this whole section exists to prevent.
+
+**The connection survives.** It is released, not reaped, and stays
+usable. The client learns on its next `KEY_UP`, which returns
+`ERR_KEY_NOT_HELD` — that error is the signal that its hold set and the
+daemon's have diverged.
+
+The timer fires on a one-second tick, so the real deadline is 30–31
+seconds. A client MUST NOT rely on the exact value; it is a safety net,
+not a schedule.
+
+### 6.4.3 Bounded by the cap
+
+§6.1.1's cap of 16 bounds the size of every release burst above.
+
+### 6.4.4 Backstopped by the kernel
+
+If the daemon dies so abruptly that none of the above runs — `SIGKILL`,
+a segfault — the kernel's teardown of the `/dev/uinput` file descriptor
+destroys both virtual devices outright. A destroyed device holds
+nothing. There is no path by which a key stays down because the daemon
+died, only paths by which it stays down for as long as the daemon takes
+to notice.
+
+## 6.5 What a client must do
+
+- **Track what you hold, per connection**, and release it. The
+  guarantees above are a safety net; a client that relies on them
+  produces a 30-second stuck modifier every time.
+- **After any disconnection, treat your hold set as empty** (§8.3). Do
+  not send releases for what a previous connection held.
+- **Treat `ERR_KEY_NOT_HELD` mid-connection as a real signal**, not
+  noise. It means the daemon released something you believe you hold —
+  almost always the dead-man timer — and your model is stale.
+- **Do not use `KEY_DOWN`/`BUTTON` down from a one-shot process.** The
+  release fires when your connection closes, so `key-down` from a
+  program that then exits is an elaborate way to write `KEY_TAP`. This
+  is why the CLI advertises both opcodes and offers no subcommand for
+  them. They exist for long-lived clients that need a code held *across*
+  other requests — a drag, or modifier-plus-motion — which is exactly
+  what `KEY_SEQUENCE` (§5B) deliberately cannot express.
 
 ---
 

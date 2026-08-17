@@ -394,6 +394,60 @@ try:
               "device)" % (dt * 1000))
     pl.close()
 
+    # --- CM: a RELEASE is never gated (WIRE.md 6.3) --------------------
+    # Found by writing 6.3, not by a failing test. The gate ran on
+    # op_touches_device() alone, so a flagged client's KEY_UP was parked
+    # for a human -- and every way the confirmation flow can end badly
+    # (denied, timed out, no confirmer) left the key DOWN. The flow fails
+    # closed by design, so the gate turned "the user said no" into a
+    # stuck modifier that only the 30-second dead-man timer would clear.
+    #
+    # The rule: policy already had its say on the PRESS, so nothing can
+    # be held that was not allowed, and re-asking on the way up can only
+    # ever create a stuck key. The rate limiter exempted releases from
+    # M4; the confirmation gate did not until now.
+    drain(efd, 0.2)
+    send_key(a, KEY_F13, 50, op=OP_KEY_DOWN)
+    pm = expect_prompt(cf)
+    if not pm:
+        fail("CM: the DOWN was not prompted -- a press must still be gated")
+    else:
+        if decide(cf, pm["token"], True) != OK:
+            fail("CM: could not approve the press")
+        elif reply(a, timeout=5)[0] != OK:
+            fail("CM: the approved press was refused")
+        else:
+            # The release must go straight through: no prompt, no wait.
+            drain(efd, 0.3)
+            t0 = time.monotonic()
+            send_key(a, KEY_F13, 51, op=OP_KEY_UP)
+            try:
+                r = reply(a, timeout=3)[0]
+            except (TimeoutError, socket.timeout):
+                # The pre-fix behaviour, and the worst of the three: the
+                # release is parked for a human who is not there, so the
+                # client gets no answer at all and the key stays down
+                # until the dead-man timer. Reported, not raised -- a
+                # negative control has to produce a legible failure.
+                r = None
+            dt = time.monotonic() - t0
+            evs = drain(efd, 0.4)
+            if r is None:
+                fail("CM: a flagged client's KEY_UP got NO reply in 3s -- it "
+                     "was parked awaiting a human, and the key is still down")
+            elif r != OK:
+                fail("CM: a flagged client's KEY_UP got result=%s -- a "
+                     "release must never be refused for a policy reason, "
+                     "or the key stays down" % r)
+            elif dt > 1.0:
+                fail("CM: the KEY_UP waited %.1fs -- it was parked for a "
+                     "human, which is the bug" % dt)
+            elif (EV_KEY, KEY_F13, 0) not in evs:
+                fail("CM: the key was not released at the device: %s" % evs)
+            else:
+                print("CM a flagged client's release is not gated (%.0f ms, "
+                      "key came back up)" % (dt * 1000))
+
     # --- CI: the confirmer vanishing denies, immediately --------------
     drain(efd, 0.2)
     send_key(a, KEY_F13, 40)
