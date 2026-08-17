@@ -49,6 +49,7 @@ SUITES = [
     ("test_m45_arbitration.py",  "own",    "held-key arbitration and the dead-man timer"),
     ("test_m5_confirm.py",       "own",    "confirmation: parked requests, fails closed, no source_tag"),
     ("test_m55_pointer.py",      "own",    "device split, buttons, rel/scroll, batch, audit coalescing"),
+    ("test_wire831_forgive.py",  "own",    "WIRE.md 8.3.1: the first release on a connection is forgiven"),
 ]
 
 # M4 step 11 named four cells; M4.5 added three more. Each maps to the
@@ -67,6 +68,7 @@ MATRIX = [
     ("buttons + drag release",  "test_m55_pointer.py"),
     ("batch all-or-nothing",    "test_m55_pointer.py"),
     ("audit volume (G10)",      "test_m55_pointer.py"),
+    ("reconnect release (8.3.1)", "test_wire831_forgive.py"),
 ]
 
 

@@ -773,6 +773,23 @@ struct conn {
   int held_count;
   time_t held_since;
 
+  /* Sticky: set at the first successful hold on this connection and
+     never cleared while the connection lives. It is NOT a count and not
+     derivable from held_count, which returns to 0 every time the client
+     releases what it had.
+
+     WIRE.md §8.3.1: a release for something this connection never held
+     is forgiven with OK *before* the connection has held anything, and
+     refused with ERR_KEY_NOT_HELD afterwards. The first case cannot be
+     distinguished from a client whose previous connection died
+     mid-gesture — the daemon released its holds (§8.3) and the client's
+     in-flight release arrived on the new connection — and there is
+     nothing for that client to fix. The second is a client that lost
+     track of its own state within one connection, which is a real bug
+     and still worth reporting. Without this flag the two collapse into
+     one case and the diagnostic is gone. */
+  int held_ever;
+
   /* --- confirmation (M5) --------------------------------------------
      `roles` is derived at HELLO from the local registry, exactly like
      `cl`, and for the same reason: the client says a name, the daemon
@@ -956,6 +973,10 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     memset(c->held_bits, 0, sizeof(c->held_bits));
     c->held_count = 0;
     c->held_since = 0;
+    /* Must start clear on every accept, or the forgiving window in
+       §8.3.1 never opens for a client landing on a slot whose previous
+       occupant held something. */
+    c->held_ever = 0;
     /* A reused slot must not inherit the previous peer's role: the
        confirmer flag in particular would let an unrelated client answer
        prompts simply by landing on the right index. */
@@ -1013,6 +1034,7 @@ static void conn_hold_add(struct conn *c, uint16_t code) {
   if (code > UINPUT_KEY_CODE_MAX || conn_holds(c, code))
     return;
   c->held_bits[code / 8] |= (unsigned char)(1u << (code % 8));
+  c->held_ever = 1; /* sticky — see the struct comment and WIRE.md §8.3.1 */
   if (c->held_count++ == 0)
     c->held_since = mono_secs(); /* oldest hold — see the struct comment */
 }
@@ -1208,6 +1230,14 @@ static int conn_held_selftest(void) {
         probe.held_since != 0) {
       fprintf(stderr, "uictld: held selftest: %u did not clear (count=%d)\n",
               code, probe.held_count);
+      bad = 1;
+    }
+    /* held_ever must NOT come back with held_count. If a drop cleared it,
+       §8.3.1's window would reopen every time a client released what it
+       held, and a mid-connection double-release — the client bug the
+       error exists to report — would be forgiven instead. */
+    if (!probe.held_ever) {
+      fprintf(stderr, "uictld: held selftest: %u cleared held_ever\n", code);
       bad = 1;
     }
   }
@@ -1454,6 +1484,7 @@ static void conn_close(int epfd, struct conn *c, const struct uinput_devs *devs,
   memset(c->held_bits, 0, sizeof(c->held_bits));
   c->held_count = 0;
   c->held_since = 0;
+  c->held_ever = 0;
   c->is_confirmer = 0;
   c->awaiting_confirm = 0;
   c->confirm_verdict = 0;
@@ -2411,6 +2442,16 @@ static void conn_handle_frame(int epfd, struct conn *c, const struct uinput_devs
       snprintf(args, sizeof(args), "code=%u down", b.code);
     } else {
       if (!conn_holds(c, b.code)) {
+        /* Same forgiving window as OP_KEY_UP — WIRE.md §8.3.1. A drag
+           interrupted by a daemon restart is the motivating case: the
+           button went up when the old connection died, and the client's
+           "finish the drag" release lands here on the new one. */
+        if (!c->held_ever) {
+          snprintf(args, sizeof(args), "code=%u not held, forgiven (§8.3.1)",
+                   b.code);
+          result = OK;
+          break;
+        }
         snprintf(args, sizeof(args), "code=%u not held", b.code);
         result = ERR_KEY_NOT_HELD;
         break;
@@ -2813,7 +2854,20 @@ static void conn_handle_frame(int epfd, struct conn *c, const struct uinput_devs
       /* Includes the case where the dead-man timer already released it.
          Reported, not silently OK'd: a client that is releasing keys it
          does not hold has lost track of its own state, and that is worth
-         knowing even though the outcome it wanted (key is up) is true. */
+         knowing even though the outcome it wanted (key is up) is true.
+
+         Unless nothing has ever been held on this connection — WIRE.md
+         §8.3.1. Then this is the reconnect case, the key is up because
+         the daemon released it when the old connection died, and there
+         is no client bug to report. OK, and deliberately no write: the
+         key is already up and a redundant value-0 event would be a
+         device effect produced by a request the spec calls a no-op. */
+      if (!c->held_ever) {
+        snprintf(args, sizeof(args), "code=%u not held, forgiven (§8.3.1)",
+                 key.keycode);
+        result = OK;
+        break;
+      }
       snprintf(args, sizeof(args), "code=%u not held by this connection",
                key.keycode);
       result = ERR_KEY_NOT_HELD;
