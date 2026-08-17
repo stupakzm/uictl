@@ -168,3 +168,32 @@ def open_node(path):
         os.close(fd)
         raise RuntimeError("cannot grab %s: %s" % (path, e))
     return fd
+
+
+def grab_all():
+    """Grab both nodes without reading either. Returns a list of fds.
+
+    For the suites that assert on result codes and never look at a
+    device -- they still INJECT, and MOVE_ABS is not policy-gated, so an
+    ungrabbed one moves the real pointer. Two of them did, into a hot
+    corner, which opened the session's overview twice in one run.
+
+    Every suite that sends a device opcode calls this or open_node(),
+    with no exceptions and no reliance on the runner to do it for them:
+    a rule that only holds under run_all.py is a rule that breaks the
+    first time someone runs one suite on its own. run_all.py enforces it
+    statically -- see its GRAB_EXEMPT note.
+
+    Call it right after the daemon is up. Any injection before the grab
+    still reaches the session.
+    """
+    fds = []
+    try:
+        for node in (pointer_node(), keyboard_node()):
+            if node:
+                fds.append(open_node(node))
+    except Exception:
+        for fd in fds:
+            os.close(fd)
+        raise
+    return fds

@@ -74,6 +74,36 @@ MATRIX = [
 ]
 
 
+# ---- the grab invariant, checked rather than remembered --------------
+# A suite that sends any of these makes the kernel emit a real event on a
+# real device, which the compositor delivers to whatever has focus. It
+# must therefore hold an EVIOCGRAB on the nodes first -- open_node() if
+# it reads events, grab_all() if it only injects.
+#
+# This check exists because the rule was already stated in a comment and
+# still missed three suites: the two that never read a device were easy
+# to overlook precisely because they had no reason to open one. They
+# moved the pointer into a hot corner instead.
+DEVICE_OPS = ("OP_MOVE_ABS", "OP_MOVE_REL", "OP_SCROLL", "OP_BUTTON",
+              "OP_KEY_TAP", "OP_KEY_SEQUENCE", "OP_KEY_DOWN", "OP_BATCH")
+
+
+def check_grabs(suites):
+    """Static scan. Returns a list of offending suite names."""
+    bad = []
+    for suite, _, _ in suites:
+        try:
+            src = open(os.path.join(HERE, suite)).read()
+        except OSError:
+            continue
+        body = "\n".join(l for l in src.splitlines()
+                         if not re.match(r"\s*\(?OP_[\w, ()]*=", l))
+        if any(op in body for op in DEVICE_OPS) and \
+           "open_node(" not in src and "grab_all(" not in src:
+            bad.append(suite)
+    return bad
+
+
 def daemon_up():
     if not os.path.exists(SOCK):
         return False
@@ -113,6 +143,18 @@ def main():
               % SOCK)
         return 2
 
+    ungrabbed = check_grabs(suites)
+    if ungrabbed:
+        print("refusing to run: these suites inject device events without "
+              "grabbing a node first,\n  so their keystrokes and pointer "
+              "motion would reach your live session:\n")
+        for suite in ungrabbed:
+            print("    %s" % suite)
+        print("\n  add `uictl_expect.grab_all()` after the daemon starts "
+              "(or open_node() if\n  the suite reads events), and close the "
+              "fds in its finally block.")
+        return 2
+
     results = {}
     failed_output = []
 
@@ -146,25 +188,15 @@ def main():
             for suite, _, _ in shared:
                 results[suite] = "FAIL"
         else:
-            # The shared suites never open an event node -- they assert on
-            # result codes -- so none of them grabs, and MOVE_ABS is not
-            # policy-gated: a shared suite CAN move the real pointer, and a
-            # pointer parked in a corner is a hot corner. So the runner
-            # holds the grab on both nodes for the whole shared phase.
-            # Nothing reads these fds; the grab is the entire purpose.
-            grabbed = []
+            # The runner deliberately does NOT grab on the suites' behalf.
+            # It could, for this phase -- but then the same suite run on
+            # its own would inject into the live session, and the grab
+            # would be a property of how you invoked the tests rather
+            # than of the tests. Each suite grabs for itself; check_grabs
+            # below is what makes that true rather than intended.
             try:
-                for node in (uictl_expect.pointer_node(),
-                             uictl_expect.keyboard_node()):
-                    if node:
-                        grabbed.append(uictl_expect.open_node(node))
-                if len(grabbed) != 2:
-                    print("  WARNING: only grabbed %d/2 nodes -- injected "
-                          "events may reach your session" % len(grabbed))
                 do("shared")
             finally:
-                for fd in grabbed:
-                    os.close(fd)
                 d.send_signal(signal.SIGTERM)
                 try:
                     d.wait(timeout=10)

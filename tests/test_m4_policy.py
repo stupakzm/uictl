@@ -23,6 +23,7 @@ YY  a policy file with group/world bits is ignored entirely -- which
     under default-deny means no keys, i.e. it fails safe.
 """
 import os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time
+import uictl_expect          # grab_all: keep injection off the live session
 
 SOCK = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uictld.sock")
 HDR = "<HHIII"
@@ -106,10 +107,25 @@ def start(home, policy=None, mode=0o600):
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True)
     time.sleep(0.8)
+    # This suite never reads a device -- it asserts on result codes and
+    # the audit log -- but it does inject, and an ungrabbed MOVE_ABS
+    # moves the real pointer into whatever is at those coordinates. The
+    # grab lives here rather than at the top of the run because the
+    # suite restarts the daemon for every policy case, and each restart
+    # creates a fresh pair of device nodes to grab.
+    if d.poll() is None:
+        _grabs.extend(uictl_expect.grab_all())
     return d
 
 
+_grabs = []
+
+
 def stop(d):
+    # Release before the daemon dies, so the fds we close are the nodes
+    # we actually took.
+    while _grabs:
+        os.close(_grabs.pop())
     d.send_signal(signal.SIGTERM)
     try:
         d.wait(timeout=5)

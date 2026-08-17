@@ -35,6 +35,15 @@ EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
 KEY_A, KEY_POWER, KEY_MAX = 30, 116, 767
 ok = True
 
+# This suite injects device opcodes but never reads a device, so it has
+# no reason to open a node -- which is exactly why it was missed. The
+# grab is purely to keep those events off the live session; MOVE_ABS is
+# not policy-gated, and an ungrabbed one moves the real pointer. Held
+# for the whole run and released by process exit, including on a crash.
+# run_all.py deliberately does not do this on the suite's behalf: then
+# running this file directly would still inject into the session.
+_GRABS = uictl_expect.grab_all()
+
 
 def fail(msg):
     global ok

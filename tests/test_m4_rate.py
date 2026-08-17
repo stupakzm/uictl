@@ -26,6 +26,7 @@ AN  **the daemon-wide backstop.** A per-pid bucket alone is bypassable by
     its own class limit, must still be capped in aggregate.
 """
 import os, re, shutil, signal, socket, struct, subprocess, sys, tempfile, time
+import uictl_expect          # grab_all: keep injection off the live session
 import multiprocessing as mp
 
 SOCK = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uictld.sock")
@@ -111,10 +112,21 @@ def start_daemon(home, registry=None):
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True)
     time.sleep(0.8)
+    # Grabbed even though nothing here reads a device: this suite injects
+    # MOVE_ABS and KEY_SEQUENCE for real, and an ungrabbed MOVE_ABS moves
+    # the live pointer. Taken per daemon start, because each start makes
+    # a fresh pair of nodes.
+    if d.poll() is None:
+        _grabs.extend(uictl_expect.grab_all())
     return d
 
 
+_grabs = []
+
+
 def stop(d):
+    while _grabs:
+        os.close(_grabs.pop())
     d.send_signal(signal.SIGTERM)
     try:
         d.wait(timeout=5)
