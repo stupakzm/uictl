@@ -127,10 +127,11 @@ def make_home():
     cfg = os.path.join(home, ".config", "uictl")
     os.makedirs(cfg)
     os.makedirs(os.path.join(home, ".local", "state"))
-    # F13-F24 and the unassigned codes above. All unbound on a normal
-    # desktop. Never widen this -- the suite injects for real.
+    # F13-F24. Never widen this -- the suite injects for real, and the
+    # codes just above F24 are Super and a level-5 shift once XKB is done
+    # with them. See uictl_expect.SAFE_POLICY.
     with open(os.path.join(cfg, "policy"), "w") as f:
-        f.write("183-199\n")
+        f.write(uictl_expect.SAFE_POLICY)
     os.chmod(os.path.join(cfg, "policy"), 0o600)
     with open(os.path.join(cfg, "clients"), "w") as f:
         f.write("forgive interactive\n")

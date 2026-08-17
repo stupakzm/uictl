@@ -45,6 +45,7 @@ DEV_NAME = "uictl virtual pointer"
 HDR = "<HHIII"
 OP_PING, OP_MOVE_ABS, OP_HELLO, OP_KEY_TAP = 1, 2, 3, 4
 OP_KEY_SEQUENCE, OP_KEY_DOWN, OP_KEY_UP = 5, 6, 7
+OP_BUTTON = 11                  # M5.5; BA needs it to fill the hold cap
 (OK, ERR_VERSION, ERR_OPCODE_UNKNOWN, ERR_PAYLOAD_INVALID,
  ERR_DENIED_BY_POLICY, ERR_TOO_LARGE, ERR_INTERNAL, ERR_BUSY,
  ERR_HANDSHAKE_REQUIRED, ERR_KEY_DENYLISTED, ERR_KEY_NOT_ALLOWED,
@@ -54,6 +55,7 @@ EV_SYN, EV_KEY = 0x00, 0x01
 SYN_REPORT = 0
 KEY_F13, KEY_F14, KEY_F15 = 183, 184, 185
 KEY_A, KEY_POWER = 30, 116
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA = 272, 273, 274, 275, 276
 MAX_HELD = 16
 EVENT_FMT = "@llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
@@ -102,6 +104,15 @@ def key(s, op, code):
     return reply(s)[0]
 
 
+def button(s, code, down):
+    """OP_BUTTON. A press and a release, held in the same bitset as keys
+    -- which is why BA can fill the cap with a mix of the two."""
+    _seq[0] += 1
+    p = struct.pack("<HBB", code, 1 if down else 0, 0)
+    s.sendall(struct.pack(HDR, 1, OP_BUTTON, 1, _seq[0], len(p)) + p)
+    return reply(s)[0]
+
+
 def event_node():
     """The KEYBOARD node since M5.5: key events moved there when the one
     hybrid device became a pointer and a keyboard. MOVE_ABS cases use
@@ -137,10 +148,11 @@ def make_home(prefix):
     cfg = os.path.join(home, ".config", "uictl")
     os.makedirs(cfg)
     os.makedirs(os.path.join(home, ".local", "state"))
-    # 183-199: F13-F24 and the unassigned codes above them. All unbound on
-    # a normal desktop. Never widen this -- the suite injects for real.
+    # F13-F24 only. This used to be 183-199, on the theory that the codes
+    # above F24 were unassigned -- they are, in the kernel header, but XKB
+    # maps them to Super and a level-5 shift. See uictl_expect.SAFE_POLICY.
     with open(os.path.join(cfg, "policy"), "w") as f:
-        f.write("183-199\n")
+        f.write(uictl_expect.SAFE_POLICY)
     os.chmod(os.path.join(cfg, "policy"), 0o600)
     # interactive (50/s), so arbitration cases are not fighting the
     # rate limiter. BC uses a separate process with an unlisted name.
@@ -296,18 +308,38 @@ try:
               "allowlist), nothing reached the device")
 
     # --- BA: the per-connection hold cap ------------------------------
+    # The cap is 16 and only 12 keycodes are safe to inject (F13-F24 --
+    # see uictl_expect.SAFE_POLICY). This used to walk 183..198 to make
+    # up the difference, which held Super and a level-5 shift down for
+    # the length of the check; the launcher opened and every key after
+    # it produced a different character.
+    #
+    # The remaining four holds come from buttons instead, which is a
+    # better test as well as a safer one: held_bits is ONE bitset for
+    # keys and buttons together, so a cap that counted them separately
+    # would pass a keys-only check and still let a connection hold 16 of
+    # each. BTN_LEFT is deliberately the one left over to be refused --
+    # it is never pressed, so nothing here can start a drag or a
+    # selection.
     drain(efd, 0.2)
-    held = []
+    held = []                       # (is_button, code)
     over = None
-    for code in range(183, 183 + MAX_HELD + 1):
-        r = key(a, OP_KEY_DOWN, code)
+    ladder = ([(0, c) for c in range(183, 195)] +
+              [(1, c) for c in (BTN_SIDE, BTN_EXTRA, BTN_MIDDLE, BTN_RIGHT,
+                                BTN_LEFT)])
+    if len(ladder) != MAX_HELD + 1:
+        fail("BA: ladder is %d codes, need exactly MAX_HELD+1 (%d)"
+             % (len(ladder), MAX_HELD + 1))
+    for is_btn, code in ladder:
+        r = button(a, code, 1) if is_btn else key(a, OP_KEY_DOWN, code)
         if r == OK:
-            held.append(code)
+            held.append((is_btn, code))
         elif r == ERR_TOO_MANY_HELD:
             over = code
             break
         else:
-            fail("BA: unexpected result=%s at code=%d" % (r, code))
+            fail("BA: unexpected result=%s at code=%d (button=%d)"
+                 % (r, code, is_btn))
             break
     drain(efd, 0.5)
     if over is None:
@@ -317,17 +349,18 @@ try:
     else:
         # the refusal must not have disturbed what is already held
         drain(efd, 0.2)
-        r = key(a, OP_KEY_UP, held[0])
+        first = held[0][1]
+        r = key(a, OP_KEY_UP, first)
         evs = keys_only(drain(efd, 0.4))
-        if r != OK or evs != [(EV_KEY, held[0], 0)]:
+        if r != OK or evs != [(EV_KEY, first, 0)]:
             fail("BA: after the cap refusal, releasing a held key gave "
                  "result=%s evs=%s" % (r, evs))
         else:
-            print("BA cap of %d enforced; the keys already held were "
-                  "undisturbed" % MAX_HELD)
+            print("BA cap of %d enforced across keys and buttons in one "
+                  "bitset; what was held stayed held" % MAX_HELD)
             held.pop(0)
-    for code in held:
-        key(a, OP_KEY_UP, code)
+    for is_btn, code in held:
+        button(a, code, 0) if is_btn else key(a, OP_KEY_UP, code)
     drain(efd, 0.5)
 
     # --- BC: UP is not rate limited -----------------------------------

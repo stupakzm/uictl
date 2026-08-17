@@ -67,6 +67,32 @@ def describe(bitmap):
     return "; ".join(parts) or "matches"
 
 
+# ---- the only key range a suite may inject ---------------------------
+# The suites inject for real, into the live session. This is the range
+# that is safe to do it with, in one place, because getting it wrong is
+# not a failing test -- it is the developer's desktop reacting.
+#
+# 183-194 is KEY_F13..KEY_F24, which xkeyboard-config maps to X keycodes
+# 191-202 (<FK13>..<FK24>) and which no desktop binds by default.
+#
+# DO NOT extend this to 195-199 on the grounds that the kernel header
+# leaves them unassigned. It does, and they are still not free: the X
+# keycode is the Linux keycode + 8, and
+# /usr/share/X11/xkb/keycodes/evdev assigns 203-207 to <LVL5>, <ALT>,
+# <META>, <SUPR>, <HYPR>. Linux 198 is therefore Super -- injecting it
+# opens the launcher or overview and whatever window then takes focus
+# receives the rest of the run -- and Linux 195 is a level-5 shift that
+# silently changes what every subsequent key produces. Both sat in a
+# suite's policy file until 2026-08-17 under a comment asserting they
+# were unbound, and both were observed doing exactly this.
+#
+# Anything outside this range belongs in a deny-list assertion, where
+# the point is that the daemon refuses it and nothing reaches the
+# device. Never in a policy file.
+SAFE_KEY_MIN, SAFE_KEY_MAX = 183, 194
+SAFE_POLICY = "%d-%d\n" % (SAFE_KEY_MIN, SAFE_KEY_MAX)
+
+
 # ---- device nodes (M5.5 split the one device into two) ---------------
 # Key events moved to "uictl virtual keyboard"; the pointer keeps its
 # name (M3 decision 1: compositors key per-device config off it, so it
