@@ -39,6 +39,7 @@ SUITES = [
     ("test_m36_hello.py",        "shared", "handshake enforcement, no forged audit lines"),
     ("test_m4_evkey.py",         "shared", "device keybits vs advertised capabilities"),
     ("test_m4_wire.py",          "shared", "OP_KEY_TAP as a client sees it; deny-list on the wire"),
+    ("test_wire9_vectors.py",    "shared", "WIRE.md 9: the vectors match the header AND the daemon"),
 
     ("test_m36_version.py",      "own",    "version range intersection, pinned after HELLO"),
     ("test_m36_identity.py",     "own",    "client registry -> class; source_tag is audit-only"),
@@ -77,6 +78,7 @@ MATRIX = [
     ("reconnect storm (8.7)",     "test_wire87_storm.py"),
     ("pointer spec (5A)",         "test_wire5a_pointer.py"),
     ("keyboard spec (5B)",        "test_wire5b_keyboard.py"),
+    ("conformance vectors (9)",   "test_wire9_vectors.py"),
 ]
 
 

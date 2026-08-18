@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""WIRE.md 9: the conformance vectors are real, and they still match.
+
+Two independent claims, and the second is the one with teeth.
+
+DRIFT  the vectors printed in WIRE.md are byte-for-byte what
+       tests/gen_vectors.c emits today. The generator reads every
+       offset, size and enum value from src/proto.h, so a field that
+       moves in the header and not in the document fails here instead of
+       being discovered by whoever implements a client against the
+       document six months later. This is the mechanism that makes "the
+       spec is generated" true rather than aspirational -- the same
+       lesson as run_all.check_grabs: a comment is not a mechanism.
+
+LIVE   the daemon actually answers the documented request bytes with
+       the documented response bytes. The vectors are written from
+       WIRE.md, and WIRE.md is written from the design; without this
+       half, both could agree with each other and disagree with the
+       shipped daemon.
+
+Deliberately injects NOTHING. Every live vector is a handshake, a
+liveness probe, or a refusal, so this suite needs no EVIOCGRAB and
+cannot disturb the session. That is why it is safe to run first.
+
+Runs against an already-running daemon (shared mode): it only opens
+connections and reads replies.
+
+VA  the generator builds, and its output is identical to the block
+    between the two markers in WIRE.md.
+VB  R1 -> a response whose fixed fields equal S2. The [varies] fields
+    are read, not asserted, exactly as 9.0 requires of a client.
+VC  R2 -> S1, byte for byte. Nothing in a PING response varies.
+VD  the pre-handshake refusal: R3's bytes on a fresh connection give
+    S4, byte for byte.
+VE  N4 (a name carrying a newline) is refused, and the daemon does not
+    echo the name anywhere in the reply.
+VF  N1 (payload_len one over the cap) is refused with ERR_TOO_LARGE and
+    the connection is then closed by the daemon, header-only -- no
+    payload is sent and none is read.
+"""
+import os, re, socket, struct, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+WIRE = os.path.join(REPO, "WIRE.md")
+SOCK = os.path.join(os.environ["XDG_RUNTIME_DIR"], "uictld.sock")
+HDR = "<HHIII"
+HDR_SIZE = struct.calcsize(HDR)
+BEGIN = "<!-- BEGIN GENERATED VECTORS -->"
+END = "<!-- END GENERATED VECTORS -->"
+
+ok = True
+
+
+def fail(msg):
+    global ok
+    ok = False
+    print("FAIL: " + msg)
+
+
+def skip(msg):
+    print("SKIP: " + msg)
+    sys.exit(0)
+
+
+# ---- VA: the document is what the generator prints --------------------
+
+def generated():
+    """Build gen_vectors into a temp dir and capture its stdout."""
+    with tempfile.TemporaryDirectory() as td:
+        binp = os.path.join(td, "gen_vectors")
+        cc = os.environ.get("CC", "cc")
+        b = subprocess.run([cc, "-D_GNU_SOURCE", "-std=c11", "-Wall",
+                            os.path.join(HERE, "gen_vectors.c"), "-o", binp],
+                           capture_output=True, text=True)
+        if b.returncode != 0:
+            return None, b.stderr
+        r = subprocess.run([binp], capture_output=True, text=True)
+        if r.returncode != 0:
+            return None, r.stderr
+        return r.stdout, None
+
+
+doc = open(WIRE).read()
+if BEGIN not in doc or END not in doc:
+    fail("VA: WIRE.md has no generated-vector markers")
+    print("\n== FAIL ==")
+    sys.exit(1)
+
+in_doc = doc.split(BEGIN, 1)[1].split(END, 1)[0]
+gen, err = generated()
+if gen is None:
+    fail("VA: gen_vectors did not build or run: %s" % err)
+else:
+    # The document keeps one blank line after each marker; the generator
+    # emits neither, so compare on the stripped bodies rather than
+    # encoding whitespace-around-markers into both sides.
+    if in_doc.strip() == gen.strip():
+        print("VA WIRE.md 9 matches gen_vectors.c exactly (%d lines)"
+              % len(gen.strip().splitlines()))
+    else:
+        dl = in_doc.strip().splitlines()
+        gl = gen.strip().splitlines()
+        first = next((i for i in range(max(len(dl), len(gl)))
+                      if i >= len(dl) or i >= len(gl) or dl[i] != gl[i]), 0)
+        fail("VA: WIRE.md 9 has drifted from gen_vectors.c at body line %d\n"
+             "      doc: %r\n      gen: %r"
+             % (first + 1,
+                dl[first] if first < len(dl) else "<missing>",
+                gl[first] if first < len(gl) else "<missing>"))
+
+# ---- parse the vectors back out of the document -----------------------
+#
+# Parsed from WIRE.md, not rebuilt in Python. A suite that re-encoded the
+# frames from struct.pack would be testing its own encoder against the
+# daemon and would agree with a document that had gone wrong.
+
+def vectors(text):
+    out = {}
+    for m in re.finditer(r"^#### ([RSPN]\d+) — .*?\n\n(.*?)```\n(.*?)```",
+                         text, re.S | re.M):
+        vid, body = m.group(1), m.group(3)
+        raw = bytearray()
+        for line in body.splitlines():
+            parts = line.split()
+            for b in parts[1:]:
+                raw += bytes([int(b, 16)])
+        out[vid] = bytes(raw)
+    return out
+
+
+V = vectors(in_doc)
+want = ["R1", "R2", "R3", "S1", "S2", "S4", "N1", "N4"]
+missing = [v for v in want if v not in V]
+if missing:
+    fail("VA: vectors not parseable out of WIRE.md: %s" % ",".join(missing))
+    print("\n== FAIL ==")
+    sys.exit(1)
+
+
+# ---- the live half ----------------------------------------------------
+
+def conn():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(SOCK)
+    return s
+
+
+def read_frame(s):
+    head = b""
+    while len(head) < HDR_SIZE:
+        chunk = s.recv(HDR_SIZE - len(head))
+        if not chunk:
+            return None, None
+        head += chunk
+    ver, op, src, seq, plen = struct.unpack(HDR, head)
+    body = b""
+    while len(body) < plen:
+        chunk = s.recv(plen - len(body))
+        if not chunk:
+            return None, None
+        body += chunk
+    return head + body, (ver, op, src, seq, plen)
+
+
+if not os.path.exists(SOCK):
+    skip("no daemon at %s (this suite is shared-mode)" % SOCK)
+
+try:
+    probe = conn()
+    probe.close()
+except OSError as e:
+    skip("cannot reach the daemon: %s" % e)
+
+# VB -- HELLO. Compare the fields 9.0 does not mark [varies]; read the
+# rest. proto_selected, and the whole 16-byte echoed header, are fixed.
+RESP_HELLO = "<HHIQII BBHI".replace(" ", "")
+s = conn()
+s.sendall(V["R1"])
+got, hdr = read_frame(s)
+if got is None:
+    fail("VB: daemon closed on the documented HELLO")
+else:
+    if got[:HDR_SIZE] != V["S2"][:HDR_SIZE]:
+        fail("VB: echoed header differs\n      want %s\n      got  %s"
+             % (V["S2"][:HDR_SIZE].hex(), got[:HDR_SIZE].hex()))
+    elif got[HDR_SIZE:HDR_SIZE + 2] != V["S2"][HDR_SIZE:HDR_SIZE + 2]:
+        fail("VB: result is not OK: %s" % got[HDR_SIZE:HDR_SIZE + 2].hex())
+    else:
+        f = struct.unpack(RESP_HELLO, got[HDR_SIZE + 2:HDR_SIZE + 2 + 32])
+        w = struct.unpack(RESP_HELLO, V["S2"][HDR_SIZE + 2:HDR_SIZE + 2 + 32])
+        # proto_selected (0), abs_range_max (2), the two reserved fields
+        # (5 and 9) are asserted. device_caps, opcode_bitmap and
+        # daemon_version are [varies] -- read, reported, not asserted.
+        for i, name in ((0, "proto_selected"), (2, "abs_range_max"),
+                        (5, "reserved"), (9, "reserved2")):
+            if f[i] != w[i]:
+                fail("VB: %s = %r, vector says %r" % (name, f[i], w[i]))
+        if f[3] != w[3]:
+            print("VB note: opcode_bitmap 0x%016x, vector 0x%016x "
+                  "([varies] -- regenerate 9 if this build added an opcode)"
+                  % (f[3], w[3]))
+        if ok:
+            print("VB HELLO answered per S2: header echoed, fixed fields "
+                  "match, caps=0x%04x bitmap=0x%016x read not asserted"
+                  % (f[1], f[3]))
+s.close()
+
+# VC -- PING. Nothing here varies, so this is a byte-for-byte comparison
+# of a whole frame in both directions.
+s = conn()
+s.sendall(V["R2"])
+got, _ = read_frame(s)
+if got != V["S1"]:
+    fail("VC: PING response\n      want %s\n      got  %s"
+         % (V["S1"].hex(), (got or b"").hex()))
+else:
+    print("VC PING answered byte-for-byte as S1")
+s.close()
+
+# VD -- the pre-handshake refusal, also byte-for-byte.
+s = conn()
+s.sendall(V["R3"])
+got, _ = read_frame(s)
+if got != V["S4"]:
+    fail("VD: pre-handshake refusal\n      want %s\n      got  %s"
+         % (V["S4"].hex(), (got or b"").hex()))
+else:
+    print("VD a device request before HELLO is refused exactly as S4")
+s.close()
+
+# VE -- the forged-audit-line name. Refused, and the reply must not
+# carry the name back: 3.5 says the daemon does not echo a name that
+# just failed the check making it safe to log.
+s = conn()
+s.sendall(V["N4"])
+got, hdr = read_frame(s)
+if got is None:
+    fail("VE: daemon closed on the bad-name HELLO instead of answering")
+else:
+    result = struct.unpack("<H", got[HDR_SIZE:HDR_SIZE + 2])[0]
+    if result != 3:                      # ERR_PAYLOAD_INVALID
+        fail("VE: result %d, want 3 (ERR_PAYLOAD_INVALID)" % result)
+    elif b"ctl" in got[HDR_SIZE:]:
+        fail("VE: the reply echoed part of the rejected name")
+    else:
+        print("VE a newline in client_name is refused, and not echoed back")
+s.close()
+
+# VF -- the one field an attacker fully controls. Header only: if the
+# daemon waits for 4097 bytes of payload it will hang here and the
+# recv times out, which is itself the failure.
+s = conn()
+s.sendall(V["N1"])
+got, _ = read_frame(s)
+if got is None:
+    fail("VF: no reply to the oversized header; 2.6 requires the error "
+         "to be written before the close")
+else:
+    result = struct.unpack("<H", got[HDR_SIZE:HDR_SIZE + 2])[0]
+    if result != 5:                      # ERR_TOO_LARGE
+        fail("VF: result %d, want 5 (ERR_TOO_LARGE)" % result)
+    else:
+        tail = s.recv(1)
+        if tail:
+            fail("VF: connection still open after ERR_TOO_LARGE; 2.6 makes "
+                 "this fatal to the stream")
+        else:
+            print("VF an oversized payload_len is refused, then the "
+                  "connection is closed")
+s.close()
+
+print("\n== PASS ==" if ok else "\n== FAIL ==")
+sys.exit(0 if ok else 1)

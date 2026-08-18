@@ -1,6 +1,6 @@
 # uictl wire protocol
 
-**Status:** draft. **Protocol version:** 1. **Daemon:** 0.3.0.
+**Status:** complete. **Protocol version:** 1. **Daemon:** 0.3.0.
 
 This is the normative specification of the protocol spoken between a
 uictl client and `uictld` over the `AF_UNIX` socket at
@@ -26,9 +26,9 @@ decisions but is checked by the compiler.
 | 5A | **Opcodes — the pointer** | **normative** |
 | 5B | **Opcodes — the keyboard, and `BATCH`** | **normative** |
 | 6 | **Held state** | **normative** |
-| 7 | Confirmation | *not yet written* |
+| 7 | **Confirmation** | **normative** |
 | 8 | **Connection lifecycle and restart** | **normative** |
-| 9 | Conformance vectors | *not yet written* |
+| 9 | **Conformance vectors** | **normative** |
 
 ---
 
@@ -1489,6 +1489,290 @@ to notice.
 
 ---
 
+# 7. Confirmation
+
+## 7.0 What this is, and what it is not
+
+Confirmation puts a human between a **flagged client** and the user's
+keyboard and pointer. A client whose registry entry carries the
+`confirm` role has every device-touching request parked until a person
+answers a prompt.
+
+**It is a speed bump in front of a cooperative client, not a boundary
+against a hostile one.** Client names are self-asserted at `HELLO`
+(§3.5), so a hostile process of the same uid can claim the confirmer's
+name and approve its own requests. Nothing name-based can prevent that:
+an `AF_UNIX` socket authenticates a **uid, not a binary**, which is the
+entire reason this broker exists. What bounds a hostile client is the
+deny-list, the allowlist, and the rate limiter — see §5B.0 and §5A.0.
+
+Stating that plainly is part of the specification. A reader who mistakes
+this section for an authorization boundary will design something on top
+of it that does not hold. Per-binary peer identity (`/proc/<pid>/exe`)
+is a separate, later milestone, and it is what a real boundary would
+need first.
+
+The prompter is a **separate binary that connects like any other
+client** — `uictl-confirm` in this tree. The daemon never `fork`s and
+never `exec`s, so it cannot summon a prompter; the prompter comes to it.
+That closes an entire branch of attack surface, and the cost is that
+confirmation is unavailable when nobody is running one, which §7.6
+resolves by failing closed.
+
+## 7.1 Two roles, and they are different
+
+Both come from `~/.config/uictl/clients` (§3.5), never from anything in
+a frame:
+
+| role word | meaning |
+|---|---|
+| `confirm` | this client's device requests are parked until a human answers |
+| `confirmer` | this client may subscribe and answer prompts |
+
+They are independent. A client with neither — the default for any
+unregistered name — is not gated and cannot subscribe.
+
+Nothing stops one entry carrying both, and the spec does not forbid it,
+but a client that must confirm its own requests deadlocks the moment it
+sends one: the prompt goes to a connection that is parked waiting for
+the answer.
+
+## 7.2 Subscribing — `OP_CONFIRM_SUBSCRIBE` (8)
+
+Zero payload. `payload_len` MUST be 0; anything else is
+`ERR_PAYLOAD_INVALID`. The request *is* the whole message — who may send
+it is decided from the registry, not from anything in the frame.
+
+Refused with `ERR_NOT_CONFIRMER` (19) in two cases:
+
+1. The client's registry entry does not carry the `confirmer` role.
+   Without this check any client could subscribe and then approve its own
+   requests, which is not a gate but a formality.
+2. **A confirmer is already subscribed.** First subscriber wins. The
+   alternative — newest wins — lets any client that can claim the name
+   silently displace a live confirmer, and the displaced one would have
+   no way to know it had stopped being asked.
+
+`ERR_NOT_CONFIRMER` does not distinguish the two on the wire, and that
+is deliberate: both mean "you are not the confirmer", and which one it
+was is a local configuration question, answerable from the daemon's
+stderr and the audit log.
+
+Subscription is per connection and dies with it (§8.2).
+
+## 7.3 What gets confirmed
+
+A request is parked when **both** hold:
+
+1. the opcode touches the device — `MOVE_ABS`, `MOVE_REL`, `SCROLL`,
+   `BUTTON`, `KEY_TAP`, `KEY_SEQUENCE`, `KEY_DOWN`, `KEY_UP`, `BATCH`;
+2. it is **not a release**.
+
+There is no "pointer motion is harmless" exemption. A flagged client
+that can move the pointer and click can do anything the user can.
+
+### 7.3.1 A release is never parked
+
+`KEY_UP`, and `BUTTON` with `down == 0`, are **never** confirmed. This
+is the same rule §6.3 states for policy and the rate limiter, and it
+arrived here late: until it was written down, a flagged client's
+`KEY_UP` was parked for a human, and a denial, a timeout, or a missing
+confirmer left the key **down**. Every one of those is a normal outcome
+of this flow — it fails closed by design — so the gate turned "the user
+said no" into a stuck modifier that only the 30-second dead-man timer
+(§6.4.2) would clear.
+
+The test is **payload-aware, not opcode-aware**, because `BUTTON`
+carries both directions in one opcode. A malformed payload is NOT
+treated as a release: it falls through to the gate and only then to the
+size check, so a client cannot dodge confirmation by sending a short
+frame.
+
+### 7.3.2 Where the gate sits
+
+After the handshake and after the rate limit, before the opcode switch
+(§5A.0). After the rate limit so a flooding client is refused before a
+human is bothered; after the handshake because the role is derived from
+the name a `HELLO` established.
+
+Note what is gated: the client's **role**, never its `source_tag`. The
+original design keyed this on `source_tag & SRC_LLM`, which the client
+writes itself — the LLM agent would simply not set the bit. §2.5 names a
+confirmation prompt as one of the things that must never read that field.
+
+## 7.4 The prompt — `OP_CONFIRM_REQUEST` (9)
+
+**The only frame in this protocol the daemon sends unprompted**, and the
+only exception to request/response (§2.7). It is pushed to the
+subscribed confirmer's connection. A confirmer MUST be written to read
+frames it did not ask for.
+
+Header: `opcode = 9`, `version` = the confirmer's negotiated version,
+`source_tag = 0`, and **`seq` carries the token** — so a confirmer can
+correlate without decoding the payload. It is not a response, so nothing
+is echoed; the header is built by the daemon.
+
+```c
+struct uictl_payload_confirm_req {   /* 48 bytes */
+    uint32_t token;        /* the daemon's handle on the parked request */
+    uint32_t peer_pid;     /* from SO_PEERCRED — unforgeable            */
+    uint16_t opcode;       /* what is being asked for                   */
+    uint16_t keycode;      /* the key, or 0 where not applicable        */
+    uint16_t cl;           /* daemon-derived class, never source_tag    */
+    uint16_t reserved;     /* MUST be zero                              */
+    char     client_name[32];  /* what it said at HELLO                 */
+};
+```
+
+Every field is something a person needs in order to answer.
+
+**It deliberately does not carry the raw payload of the request being
+confirmed.** Security rule 5 — the audit log records intent, not content
+— applies to a confirmation prompt for the same reason: a prompt is a
+second place the content would be exposed. The keycode is the single
+exception, because "may this client press F13" is not answerable without
+it.
+
+`MOVE_ABS` therefore reports `keycode = 0` rather than coordinates. The
+prompt says *this client wants to move the pointer*, which is the
+decision being made; pixel values would be content, not intent.
+
+`peer_pid` and `cl` come from the daemon's side of the socket.
+`client_name` is the self-asserted label, and a confirmer displaying it
+should treat it as such — §7.0.
+
+## 7.5 The decision — `OP_CONFIRM_DECIDE` (10)
+
+```c
+struct uictl_payload_confirm_decide {  /* 8 bytes */
+    uint32_t token;
+    uint8_t  allow;         /* 1 = proceed. ANY other value = refuse    */
+    uint8_t  reserved[3];   /* MUST be zero                             */
+};
+```
+
+Exact size. Non-zero `reserved` is `ERR_PAYLOAD_INVALID`.
+
+`allow` is `1` for yes and **anything else for no**, rather than a
+boolean test. A garbled byte becomes a refusal, not an approval; the
+value that means "proceed" is the one that has to be spelled correctly.
+
+Refusals:
+
+| condition | result |
+|---|---|
+| sender is not the subscribed confirmer | `ERR_NOT_CONFIRMER` (19) |
+| wrong length, or non-zero `reserved` | `ERR_PAYLOAD_INVALID` (3) |
+| no confirmation pending, or the token does not match | `ERR_PAYLOAD_INVALID` (3) |
+
+**The token is what stops a slow "yes" from approving the wrong
+request.** Tokens are issued in sequence and never reused while pending;
+a decision carrying a stale one is dropped. A stale token is the normal
+case rather than an alarming one — the request timed out, or its client
+went away, while the human was deciding — and answering `OK` would tell
+the confirmer its decision had been applied when nothing happened.
+
+The daemon's `OK` to a `DECIDE` means **the decision was accepted**, not
+that the confirmed request has completed. Those are two different
+frames on two different connections. The requester's own reply arrives
+on the requester's connection.
+
+## 7.6 The five ways a parked request ends
+
+| outcome | requester gets | |
+|---|---|---|
+| approved | the real result of the request | re-dispatched as if it had just arrived |
+| denied by a human | `ERR_CONFIRM_DENIED` (17) | terminal — retrying is asking twice |
+| nobody answered in 30 s | `ERR_CONFIRM_TIMEOUT` (18) | retryable, but assume the user is away |
+| the confirmer disconnected while parked | `ERR_CONFIRM_UNAVAILABLE` (16) | fixable — start a confirmer |
+| the requester disconnected | nothing | dropped silently; there is nobody to answer |
+
+**Approval re-dispatches the frame exactly as it was validated**, and it
+is dispatched as *resumed*: no second rate-limit charge, and no second
+prompt. Charging twice would make confirmation cost a flagged client
+double; parking twice would prompt forever. The audit line is written by
+the handler with the real outcome, which is why parking writes none.
+
+**Timeout denies, never approves.** A gate that opens when the user is
+away from the keyboard is not a gate. The timeout is checked on the same
+1 s tick as the stall reaper, so the effective deadline is 30–31 s —
+coarse on purpose, like every other deadline in this document.
+
+**A confirmer that disappears while a request is parked resolves it
+immediately as `ERR_CONFIRM_UNAVAILABLE`**, rather than leaving it to
+time out. The prompter vanishing is not consent, and the requester
+should not wait 30 s to learn something the daemon already knows.
+
+## 7.7 One at a time
+
+**There is one pending confirmation daemon-wide. It is not a queue.** A
+second confirmable request while one is pending gets `ERR_BUSY` (7).
+
+Confirmations run at human speed. A queue of prompts is a worse
+experience than a refusal, and it would let one client fill the daemon's
+memory with parked requests. `ERR_BUSY` is already the "no room, try
+again" code and needs no new meaning here.
+
+`ERR_BUSY` is also returned when the confirmer has a reply still going
+out: there is one output buffer per connection, and staging a prompt
+over it would drop whichever frame lost the race. In practice this
+lasts a millisecond.
+
+### 7.7.1 The 128-byte parking limit
+
+A parked payload is capped at **`CONFIRM_MAX_PAYLOAD = 128` bytes**.
+Over that, the request is refused with `ERR_TOO_LARGE` (5) instead of
+being parked — **a prompt that describes less than what would execute is
+worse than no prompt**, so the payload is never truncated to fit.
+
+Every confirmable payload fits except one: `KEY_*` is 2 bytes,
+`MOVE_ABS`/`MOVE_REL`/`SCROLL` 8, `BUTTON` 4, a full 16-item
+`KEY_SEQUENCE` 68 — but a full 16-item `BATCH` is 196 bytes (§5B.4). **A
+flagged client cannot send a `BATCH` of more than 10 items.** That is a
+sharp edge, and it is documented rather than papered over: the honest
+answer for a flagged client is smaller batches, since the prompt has to
+be able to describe what will happen.
+
+## 7.8 What a confirmer must do
+
+1. `HELLO` with a name the registry gives the `confirmer` role, then
+   `OP_CONFIRM_SUBSCRIBE`. Check the `OK`.
+2. Read frames it did not request. A confirmer's read loop is not
+   request/response, and a client library built on "one read per write"
+   cannot host one (§2.7).
+3. Echo the token from `seq` or from the payload — they carry the same
+   value — in `OP_CONFIRM_DECIDE`.
+4. Treat `ERR_PAYLOAD_INVALID` on a decision as "too late", not as a bug.
+   The human took longer than the request lived.
+5. Default to refusing. Anything other than an explicit yes — a closed
+   stdin, an unreadable prompt, a display that failed to open — MUST
+   produce `allow != 1` or no decision at all. Both deny.
+6. Not exit while a prompt is on screen if it can help it: disconnecting
+   resolves the pending request as `ERR_CONFIRM_UNAVAILABLE`.
+
+`uictl-confirm` is deliberately a terminal program reading `y`/`n` from
+stdin. A desktop-notification version is a nicety writable later against
+the same three frames; keeping the first one a TTY program means it is
+scriptable and testable without a compositor.
+
+## 7.9 What the audit log records
+
+A park writes **no** audit line. Nothing has been decided yet, and a
+line at park time would have to be amended by a second line at
+resolution — two records for one event, with the first one wrong.
+
+The resolution writes one line with the outcome: `confirmed by user`
+(then the handler's own line for the real result), `confirmation timed
+out`, `confirmer disconnected`, or the denial. The requester's pid, uid,
+`source_tag`, opcode and `seq` are all taken from the **parked** header,
+so the line describes the request the human actually saw.
+
+`SIGUSR1` reports a pending confirmation — its token, the opcode, and
+how many seconds it has been waiting — so an operator can tell "the
+daemon is wedged" from "somebody is being asked a question" (§8.8).
+
+---
+
 # 8. Connection lifecycle and restart
 
 ## 8.1 Why this section exists at all
@@ -1743,3 +2027,471 @@ Two entries are not "shipped" and neither is a gap in §8:
   (M-lib 2). The rule stays normative so that the library is built to it
   rather than having it retrofitted, which is the same reason §8 was
   written before M6 rather than during it.
+
+---
+
+# 9. Conformance vectors
+
+## 9.0 How to use these
+
+Byte-exact frames, little-endian, with the offset in hex at the left of
+each line. An implementation in any language can check itself against
+them without a running daemon — which is the point: the first external
+consumer is written in Rust, will not link `libuictl`, and needs
+something better than prose to test against.
+
+**These vectors are generated, not typed.** `tests/gen_vectors.c` emits
+this section from `src/proto.h`, so every offset, size and enum value
+comes from the same header the daemon compiles against.
+`tests/test_wire9_vectors.py` regenerates them and diffs against this
+file, so a field that moves in the header and not in the document is a
+test failure rather than something a reader might notice. Regenerate
+with:
+
+```
+make gen-vectors        # prints the section body to stdout
+```
+
+`plan-multiclient.md` open question 5 asked whether the vectors should
+be hex frames plus an expected decode, or a replay mode inside the
+daemon that a test harness could drive. **Hex, and the question is now
+closed.** A test mode in a security binary is a code path that exists in
+production for the benefit of tests, and this broker's whole claim is
+that it has no such paths. A hex file also serves the implementor who
+has not built the daemon yet.
+
+Fields marked **[varies]** are not part of the vector: an implementation
+MUST read them from the frame rather than assert them. They depend on
+the device that came up, the opcodes this build implements, or the
+daemon's version.
+
+Vector ids are stable. **R** = request, **S** = response, **P** = pushed
+by the daemon, **N** = a frame that MUST be rejected.
+
+<!-- BEGIN GENERATED VECTORS -->
+## 9.1 Requests
+
+Every request below is stamped `version = 1` and
+`source_tag = SRC_CLI` (1). `seq` is the client's own counter and
+is echoed untouched (§2.7); the values here are arbitrary.
+
+#### R1 — `HELLO`
+
+| field | value |
+|---|---|
+| `opcode` | `OP_HELLO` (3) |
+| `payload_len` | 36 |
+| `proto_min / proto_max` | 1 / 1 |
+| `client_name` | `"uictl"`, NUL-padded to 32 bytes |
+
+```
+0000  01 00 03 00 01 00 00 00  01 00 00 00 24 00 00 00
+0010  01 00 01 00 75 69 63 74  6c 00 00 00 00 00 00 00
+0020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+0030  00 00 00 00
+```
+
+The 27 trailing zero bytes are not optional padding a client
+may omit: `client_name` is a fixed 32-byte field and every byte
+after the NUL MUST be zero (§3.5).
+
+#### R2 — `PING` — the whole frame is the header
+
+| field | value |
+|---|---|
+| `opcode` | `OP_PING` (1) |
+| `payload_len` | 0 |
+
+```
+0000  01 00 01 00 01 00 00 00  02 00 00 00 00 00 00 00
+```
+
+#### R3 — absolute motion
+
+| field | value |
+|---|---|
+| `opcode` | `OP_MOVE_ABS` (2) |
+| `x / y` | 100 / 200, device units (§3.4) |
+
+```
+0000  01 00 02 00 01 00 00 00  03 00 00 00 08 00 00 00
+0010  64 00 00 00 c8 00 00 00
+```
+
+#### R4 — relative motion, negative delta
+
+| field | value |
+|---|---|
+| `opcode` | `OP_MOVE_REL` (12) |
+| `dx / dy` | -5 / 3 |
+
+```
+0000  01 00 0c 00 01 00 00 00  04 00 00 00 08 00 00 00
+0010  fb ff ff ff 03 00 00 00
+```
+
+`dx = -5` is `fb ff ff ff`: two's complement, little-endian.
+An implementation that encodes signed fields as sign-and-
+magnitude, or that byte-swaps, fails here and nowhere else —
+which is why this vector uses a negative number.
+
+#### R5 — scroll
+
+| field | value |
+|---|---|
+| `opcode` | `OP_SCROLL` (13) |
+| `notches_v / notches_h` | 1 / 0 — one detent up |
+
+```
+0000  01 00 0d 00 01 00 00 00  05 00 00 00 08 00 00 00
+0010  01 00 00 00 00 00 00 00
+```
+
+#### R6 — button press
+
+| field | value |
+|---|---|
+| `opcode` | `OP_BUTTON` (11) |
+| `code` | `BTN_LEFT` = 272 (0x110) |
+| `down` | 1 — press |
+| `reserved` | 0, and MUST be |
+
+```
+0000  01 00 0b 00 01 00 00 00  06 00 00 00 04 00 00 00
+0010  10 01 01 00
+```
+
+#### R7 — button release — never confirmed, never rate-charged
+
+```
+0000  01 00 0b 00 01 00 00 00  07 00 00 00 04 00 00 00
+0010  10 01 00 00
+```
+
+#### R8 — key tap
+
+| field | value |
+|---|---|
+| `opcode` | `OP_KEY_TAP` (4) |
+| `keycode` | 183 (`KEY_F13`) |
+
+```
+0000  01 00 04 00 01 00 00 00  08 00 00 00 02 00 00 00
+0010  b7 00
+```
+
+#### R9 — `KEY_SEQUENCE` — balanced Ctrl+A
+
+| field | value |
+|---|---|
+| `opcode` | `OP_KEY_SEQUENCE` (5) |
+| `count` | 4 |
+| `items` | down 29, down 30, up 30, up 29 — Ctrl+A |
+| `payload_len` | 20 = 4 + 4 x 4 |
+
+```
+0000  01 00 05 00 01 00 00 00  09 00 00 00 14 00 00 00
+0010  04 00 00 00 1d 00 01 00  1e 00 01 00 1e 00 00 00
+0020  1d 00 00 00
+```
+
+Balance is tracked per key, not counted: `down 29, down 29,
+up 29, up 29` sums to zero and is still refused (§5B.2).
+
+#### R10 — `KEY_DOWN` — same 2-byte payload as `KEY_TAP`
+
+```
+0000  01 00 06 00 01 00 00 00  0a 00 00 00 02 00 00 00
+0010  b7 00
+```
+
+#### R11 — `KEY_UP` — the frame that is never refused for policy
+
+```
+0000  01 00 07 00 01 00 00 00  0b 00 00 00 02 00 00 00
+0010  b7 00
+```
+
+#### R12 — `BATCH` — nudge then click, one device, one report
+
+| field | value |
+|---|---|
+| `opcode` | `OP_BATCH` (14) |
+| `count` | 2 |
+| `item 0` | `MOVE_REL` dx=10 dy=0 |
+| `item 1` | `BUTTON` code=272 down=1 |
+| `payload_len` | 28 = 4 + 2 x 12 |
+
+```
+0000  01 00 0e 00 01 00 00 00  0c 00 00 00 1c 00 00 00
+0010  02 00 00 00 0c 00 00 00  0a 00 00 00 00 00 00 00
+0020  0b 00 00 00 10 01 00 00  01 00 00 00
+```
+
+Both items land on the pointer, so this is one `SYN_REPORT`.
+Adding a key item would make it two — atomic per device, and
+nothing below the kernel joins them (§5B.4).
+
+#### R13 — subscribe as the confirmer
+
+| field | value |
+|---|---|
+| `opcode` | `OP_CONFIRM_SUBSCRIBE` (8) |
+| `payload_len` | 0 — the request is the whole message |
+
+```
+0000  01 00 08 00 01 00 00 00  0d 00 00 00 00 00 00 00
+```
+
+#### R14 — approve a parked request
+
+| field | value |
+|---|---|
+| `opcode` | `OP_CONFIRM_DECIDE` (10) |
+| `token` | 1 — echoed from the prompt |
+| `allow` | 1. **Any other value denies** (§7.5) |
+
+```
+0000  01 00 0a 00 01 00 00 00  0e 00 00 00 08 00 00 00
+0010  01 00 00 00 01 00 00 00
+```
+
+---
+
+## 9.2 Responses
+
+A response echoes the request's header with `payload_len`
+rewritten, then `u16 result`, then opcode-specific data (§2.4).
+Each vector below names the request it answers.
+
+#### S1 — `PING` answered
+
+| field | value |
+|---|---|
+| `answers` | R2 |
+| `payload_len` | 2 — the result and nothing else |
+| `result` | `OK` (0) |
+
+```
+0000  01 00 01 00 01 00 00 00  02 00 00 00 02 00 00 00
+0010  00 00
+```
+
+Note the echo: `opcode` is still 1 and `seq` is still 2. A
+client matches on those, not on arrival order alone.
+
+#### S2 — `HELLO` answered — the capability set
+
+| field | value |
+|---|---|
+| `answers` | R1 |
+| `payload_len` | 34 = 2 + 32 |
+| `proto_selected` | 1 |
+| `device_caps` | 0x000f — all four bits **[varies]** |
+| `abs_range_max` | 32767 |
+| `opcode_bitmap` | 0x0000000000007ffe **[varies]** |
+| `daemon_version` | 0x000300 = 0.3.0 **[varies]** |
+| `reconnect_*` | 0 = `RECONNECT_UNSPEC`, no registry advice |
+
+```
+0000  01 00 03 00 01 00 00 00  01 00 00 00 22 00 00 00
+0010  00 00 01 00 0f 00 ff 7f  00 00 fe 7f 00 00 00 00
+0020  00 00 00 03 00 00 00 00  00 00 00 00 00 00 00 00
+0030  00 00
+```
+
+**[varies]** marks a field an implementation MUST read rather
+than assert. `device_caps` is whatever the device came up
+with, `opcode_bitmap` is what this build implements, and
+`daemon_version` is informational — branching on it is the
+feature-sniffing §2.2 forbids. The three reconnect bytes and
+`reserved2` are the §8.6 tail: a client built against the
+24-byte prefix reads this same frame and ignores them.
+
+#### S3 — a command acknowledged
+
+| field | value |
+|---|---|
+| `answers` | R3 |
+| `result` | `OK` (0) |
+
+```
+0000  01 00 02 00 01 00 00 00  03 00 00 00 02 00 00 00
+0010  00 00
+```
+
+#### S4 — the correctable refusal
+
+| field | value |
+|---|---|
+| `answers` | R3, sent before any `HELLO` |
+| `result` | `ERR_HANDSHAKE_REQUIRED` (8) |
+
+```
+0000  01 00 02 00 01 00 00 00  03 00 00 00 02 00 00 00
+0010  08 00
+```
+
+Per-frame, not fatal: the payload was consumed, so the next
+frame boundary is known. Send `HELLO` on this same connection
+and retry (§4.2).
+
+#### S5 — an admission refusal (§1.2)
+
+| field | value |
+|---|---|
+| `answers` | nothing — sent before the peer is a connection |
+| `opcode` | 0 (`OP_INVALID`) |
+| `seq` | 0 |
+| `result` | `ERR_BUSY` (7) |
+
+```
+0000  01 00 00 00 00 00 00 00  00 00 00 00 02 00 00 00
+0010  07 00
+```
+
+This frame matches no request. A client that reads it as a
+reply to something it sent will mis-attribute it; a client that
+does not read it at all reports a refusal as a mysterious EOF.
+The same shape carries `ERR_DENIED_BY_POLICY` (4) when the peer
+uid does not match.
+
+---
+
+## 9.3 The frame the daemon sends unprompted
+
+#### P1 — a prompt pushed to the subscribed confirmer
+
+| field | value |
+|---|---|
+| `opcode` | `OP_CONFIRM_REQUEST` (9) |
+| `seq` | **the token**, not a client counter (§7.4) |
+| `source_tag` | 0 — the daemon sets none |
+| `token / peer_pid` | 1 / 4242 |
+| `opcode (payload)` | 4 = `KEY_TAP` |
+| `keycode` | 183 |
+| `cl` | 0 = `untrusted`, daemon-derived |
+| `client_name` | `"agent"` — self-asserted (§7.0) |
+| `payload_len` | 48 |
+
+```
+0000  01 00 09 00 00 00 00 00  01 00 00 00 30 00 00 00
+0010  01 00 00 00 92 10 00 00  04 00 b7 00 00 00 00 00
+0020  61 67 65 6e 74 00 00 00  00 00 00 00 00 00 00 00
+0030  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+```
+
+Not a response: nothing is echoed, because there was no
+request. A client library that assumes one read per write
+cannot host a confirmer (§2.7).
+
+---
+
+## 9.4 Frames a conforming daemon MUST reject
+
+These are the negative vectors. An implementation that accepts
+any of them is not conforming, and each one is a bug class rather
+than a typo.
+
+#### N1 — oversized payload — header only, no payload follows
+
+| field | value |
+|---|---|
+| `payload_len` | 4097 — one over `UICTL_MAX_PAYLOAD` |
+| `expected` | `ERR_TOO_LARGE` (5), **then close** |
+
+```
+0000  01 00 02 00 01 00 00 00  64 00 00 00 01 10 00 00
+```
+
+Fatal to the stream (§2.6): the daemon cannot know where the
+next frame starts. It MUST answer before closing, and it MUST
+NOT attempt to read 4097 bytes into a 4096-byte buffer — this
+is the vector that catches the one field an attacker fully
+controls.
+
+#### N2 — wrong payload size — the first 19 bytes on the wire
+
+| field | value |
+|---|---|
+| `payload_len` | 3, where `KEY_TAP` is exactly 2 |
+| `expected` | `ERR_PAYLOAD_INVALID` (3), per-frame |
+
+```
+0000  01 00 04 00 01 00 00 00  65 00 00 00 03 00 00 00
+0010  b7 00 00
+```
+
+Command payloads are exact-size, never `>=` (§2.3). The
+connection survives: the payload was consumed, so the next
+boundary is known.
+
+#### N3 — non-zero reserved field
+
+| field | value |
+|---|---|
+| `reserved` | 1 |
+| `expected` | `ERR_PAYLOAD_INVALID` (3) |
+
+```
+0000  01 00 05 00 01 00 00 00  66 00 00 00 08 00 00 00
+0010  01 00 01 00 b7 00 01 00
+```
+
+Reserved bytes are read and rejected, not ignored (§2.3), so a
+future field cannot collide with junk an old client left there.
+This sequence is also unbalanced, which would refuse it anyway —
+a conforming daemon MAY report either, and the reserved check
+comes first.
+
+#### N4 — a client name that would forge audit lines
+
+| field | value |
+|---|---|
+| `client_name` | `"ui\nctl"` — a newline at offset 2 |
+| `expected` | `ERR_PAYLOAD_INVALID` (3), and the name is **not** echoed |
+
+```
+0000  01 00 03 00 01 00 00 00  67 00 00 00 24 00 00 00
+0010  01 00 01 00 75 69 0a 63  74 6c 00 00 00 00 00 00
+0020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+0030  00 00 00 00
+```
+
+The audit log is newline-delimited (§3.5). A daemon that
+accepts this hands the client the ability to write invented
+denials into the record that exists to hold it accountable.
+
+#### N5 — version hopping after the handshake
+
+| field | value |
+|---|---|
+| `version` | 2, on a connection that negotiated 1 |
+| `expected` | `ERR_VERSION` (1), **then close** |
+
+```
+0000  02 00 04 00 01 00 00 00  68 00 00 00 02 00 00 00
+0010  b7 00
+```
+
+The version is pinned for the life of the connection (§3.3).
+Fatal, because a rejected version means `payload_len` is not
+trustworthy either. Sent *before* a `HELLO`, this same frame is
+`ERR_HANDSHAKE_REQUIRED` instead — the pin does not exist yet.
+
+<!-- END GENERATED VECTORS -->
+
+## 9.5 What these vectors do not cover
+
+They are a decoder test, not a daemon test. They say nothing about
+timing, about the order two connections are served in, or about
+anything with a device effect — asserting that `KEY_TAP` reaches
+`/dev/uinput` needs a real device and an `EVIOCGRAB`, which is what the
+Python suites in `tests/` are for.
+
+Nor are they exhaustive: there is one vector per *class* of mistake, not
+one per opcode-and-field combination. The five negative vectors in §9.4
+are the ones worth having — an unbounded length, a wrong size, a
+non-zero reserved field, a name that forges log lines, and a version
+hop — because each is a bug an implementation can ship without ever
+noticing.

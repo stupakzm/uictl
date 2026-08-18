@@ -23,6 +23,13 @@ uictl-confirm: src/uictl-confirm.c src/proto.h
 uictld:	$(UICTLD_SRCS) $(UICTLD_HDRS)
 	$(CC) $(CFLAGS) $(UICTLD_SRCS) -o $@ $(LDFLAGS)
 
-.PHONY: all clean
+# WIRE.md §9's conformance vectors are generated from src/proto.h rather
+# than typed, so a field that moves in the header moves in the document.
+# Not part of `all`: it is a documentation tool, not a shipped binary,
+# and tests/test_wire9_vectors.py builds it itself.
+gen-vectors: tests/gen_vectors.c src/proto.h
+	@$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) && ./$@ && rm -f $@
+
+.PHONY: all clean gen-vectors
 clean:
-	rm -f uictl uictld uictl-confirm
+	rm -f uictl uictld uictl-confirm gen-vectors
