@@ -742,6 +742,32 @@ static void audit_log(int fd, pid_t peer_pid, uid_t peer_uid, uint32_t src,
 #define CONN_PARTIAL_TIMEOUT_SEC 5
 #define REAPER_TICK_SEC 1
 
+/* ---- idle exit (M6) --------------------------------------------------
+   Off by default, and off entirely unless systemd is holding the
+   listening socket. Exiting when nothing will restart us does not make
+   the daemon cheap, it makes it absent: the socket file goes away with
+   the process and every later client gets ECONNREFUSED with nothing to
+   fix it. Under activation the same exit costs a cold start on the next
+   connect() and nothing else.
+
+   Enabled with UICTL_IDLE_EXIT_SEC in the unit's Environment=. A floor
+   applies (see IDLE_EXIT_MIN_SEC) because a very short timer races the
+   activation itself: systemd starts us BECAUSE a client connected, and a
+   daemon that gave up before that connection was accepted would be
+   restarted immediately, forever.
+
+   What it costs, so the choice is made with open eyes: exiting closes
+   /dev/uinput, so the two virtual devices are destroyed and recreated on
+   the next start. The compositor sees that as a hotplug, and the first
+   request after an idle exit pays device registration — tens of
+   milliseconds, which is most of muvor's 50 ms budget. A long-lived
+   client that wants predictable latency should leave this off. */
+#define IDLE_EXIT_MIN_SEC 5
+
+static long g_idle_exit_sec;  /* 0 = disabled */
+static time_t g_idle_since;   /* when the connection table last emptied */
+static int g_idle_expired;    /* set by the reaper, read by the loop */
+
 /* ---- admission + fairness (M3.7) ------------------------------------
    How many frames one connection may have dispatched for it in a single
    epoll_wait turn (G6), and how many concurrent connections one peer pid
@@ -1161,6 +1187,20 @@ static int conn_count_pid(pid_t pid) {
   int n = 0;
   for (int i = 0; i < MAX_CONNS; i++)
     if (conns[i].fd >= 0 && conns[i].cred.pid == pid)
+      n++;
+  return n;
+}
+
+/* Live connections, any peer. The idle-exit test, and deliberately a
+   count of CONNECTIONS rather than of held keys: a key can only be held
+   by a connection, so an empty table is the strongest statement
+   available that nothing is mid-gesture. Testing "no keys held" instead
+   would let the daemon exit under a client that is connected, idle and
+   about to send something. */
+static int conn_count_live(void) {
+  int n = 0;
+  for (int i = 0; i < MAX_CONNS; i++)
+    if (conns[i].fd >= 0)
       n++;
   return n;
 }
@@ -3581,6 +3621,33 @@ static void conn_reap_partial(int epfd, const struct uinput_devs *devs,
     confirm_resolve(epfd, devs, audit_fd, 0, ERR_CONFIRM_TIMEOUT,
                     "confirmation timed out");
 
+  /* Idle exit (M6). Checked here rather than on the last disconnect
+     because "idle" is a duration, not an event: a client that reconnects
+     every few seconds is not idle, and a table that empties and refills
+     within the window must not restart the countdown from a close.
+
+     Three conditions, and the second two are the safety. An empty
+     connection table means nothing is held, since holds belong to
+     connections. No pending confirmation means nobody is looking at a
+     prompt — which cannot happen with an empty table, and is checked
+     anyway because a condition that is cheap and currently redundant is
+     the one that survives the next change to either half.
+
+     The flag is set rather than the loop being broken from here: the
+     reaper is called from inside the event batch, and abandoning the
+     remaining events would drop work that has already arrived. */
+  if (g_idle_exit_sec > 0) {
+    if (conn_count_live() > 0 || pending_confirm.active) {
+      g_idle_since = now;
+    } else if (now - g_idle_since >= g_idle_exit_sec) {
+      fprintf(stderr,
+              "uictld: idle for %lds with no connections — exiting; "
+              "systemd will start a new instance on the next connect\n",
+              (long)(now - g_idle_since));
+      g_idle_expired = 1;
+    }
+  }
+
   for (int i = 0; i < MAX_CONNS; i++) {
     struct conn *c = &conns[i];
     if (c->fd < 0)
@@ -4233,6 +4300,53 @@ int main(void) {
             "does not remove it\n",
             path);
 
+  /* Idle exit, decided here because it depends on how we got our socket.
+     Refused rather than silently ignored when it cannot work: a unit
+     that sets this without socket activation is asking for a daemon that
+     disappears and does not come back, and the difference between "your
+     setting was wrong" and "the daemon keeps vanishing" is a debugging
+     afternoon. */
+  {
+    const char *idle = getenv("UICTL_IDLE_EXIT_SEC");
+    if (idle && *idle) {
+      errno = 0;
+      char *end;
+      long v = strtol(idle, &end, 10);
+      if (errno != 0 || *end != '\0' || v < 0) {
+        fprintf(stderr, "uictld: UICTL_IDLE_EXIT_SEC=%s is not a number of "
+                        "seconds — ignoring it\n",
+                idle);
+      } else if (v == 0) {
+        /* An explicit 0 is a legitimate way to say "off" in a unit file
+           that always sets the variable. Not a warning. */
+      } else if (!g_socket_inherited) {
+        fprintf(stderr,
+                "uictld: UICTL_IDLE_EXIT_SEC is set but this daemon was not "
+                "socket-activated — ignoring it\n"
+                "  why:  nothing would start the daemon again, so exiting "
+                "would take the\n        socket with it and every later "
+                "client would get ECONNREFUSED\n"
+                "  fix:  enable uictld.socket, or unset the variable.\n");
+      } else if (v < IDLE_EXIT_MIN_SEC) {
+        fprintf(stderr,
+                "uictld: UICTL_IDLE_EXIT_SEC=%ld is below the %d second "
+                "floor — using %d\n"
+                "  why:  activation starts this daemon BECAUSE a client "
+                "connected. a timer\n        shorter than that connection "
+                "takes to arrive is a restart loop.\n",
+                v, IDLE_EXIT_MIN_SEC, IDLE_EXIT_MIN_SEC);
+        g_idle_exit_sec = IDLE_EXIT_MIN_SEC;
+      } else {
+        g_idle_exit_sec = v;
+      }
+      if (g_idle_exit_sec > 0)
+        fprintf(stderr,
+                "uictld: will exit after %lds with no connections; the "
+                "next connect() starts a new instance\n",
+                g_idle_exit_sec);
+    }
+  }
+
   /* Ready means a client may connect and expect service: the devices are
      registered, the epoll set is armed and the accept loop is about to
      run. Sent here and not one line earlier — everything above can still
@@ -4259,7 +4373,14 @@ int main(void) {
   struct epoll_event events[8];
   int stop = 0;
 
-  while (!stop) {
+  /* The countdown starts now, not at the first disconnect. An activated
+     daemon that is started and then never spoken to is the case this has
+     to cover — otherwise a client that connects, is refused at admission
+     and goes away leaves the daemon resident for the rest of the
+     session. */
+  g_idle_since = mono_secs();
+
+  while (!stop && !g_idle_expired) {
     int nfd = epoll_wait(epfd, events, 8, -1);
     if (nfd < 0) {
       if (errno == EINTR)

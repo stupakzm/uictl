@@ -1,0 +1,158 @@
+# AppArmor profile for uictld — the uictl input broker (M7).
+#
+# WHAT THIS IS FOR. Every other control in this project is enforced by
+# the daemon's own code: the deny-list, the allowlist, the rate limiter,
+# the peer uid check. All of them are inside the process, so all of them
+# are gone the moment a parser bug lets someone take the process over.
+# This profile is the layer that still holds afterwards. It cannot stop a
+# compromised uictld from injecting input — that is what the daemon is
+# for, and there is no way to grant "write to /dev/uinput" partially —
+# but it can stop it from becoming anything more than an input injector:
+# no network, no exec, no reading other people's files, and in particular
+# no reading /dev/input/event*, which is the difference between an
+# injector and a keylogger.
+#
+# INSTALL. The attachment path is /usr/libexec/uictld, which is where M8
+# puts the daemon. Until then the binary lives in a checkout, and an
+# AppArmor profile keys on the executable's path — so a profile naming
+# /usr/libexec/uictld simply does not attach to ~/projects/uictl/uictld
+# and confines nothing. Two honest options while M8 is pending:
+#
+#   sudo install -m 0644 apparmor/usr.libexec.uictld /etc/apparmor.d/
+#   sudo apparmor_parser -r /etc/apparmor.d/usr.libexec.uictld
+#
+# and then either wait for M8, or run the checkout under the profile
+# explicitly for testing:
+#
+#   aa-exec -p uictld -- ./uictld
+#
+# Check what is actually confined with `aa-status`, and read denials
+# with `journalctl -k | grep apparmor` or `dmesg | grep DENIED`. A
+# profile that is loaded but attached to nothing is the failure mode to
+# watch for: everything works, and nothing is protected.
+#
+# COMPLAIN FIRST. Load it in complain mode, exercise the daemon
+# (`python3 tests/run_all.py` is the thorough version), and read the
+# denials before switching to enforce:
+#
+#   sudo aa-complain /etc/apparmor.d/usr.libexec.uictld
+#   ... run everything ...
+#   sudo aa-enforce  /etc/apparmor.d/usr.libexec.uictld
+#
+# A profile that goes straight to enforce and is slightly too tight
+# presents as a daemon that starts and then fails at some request nobody
+# thought to try, hours later.
+#
+# STATUS. This profile parses cleanly (`apparmor_parser -QT`), but it has
+# NOT been load-tested against a running daemon -- loading a profile
+# needs root and confining someone's session is their decision, not the
+# author's. Treat the first complain-mode run as part of the work, not as
+# a formality.
+
+abi <abi/3.0>,
+
+include <tunables/global>
+
+profile uictld /usr/libexec/uictld {
+  include <abstractions/base>
+
+  # ---- the one thing this daemon exists to do ------------------------
+  # Read as well as write: the uinput protocol is ioctl-driven, and
+  # UI_DEV_SETUP/UI_DEV_CREATE plus the sysname query are not writes.
+  /dev/uinput rw,
+
+  # ---- the one thing it must never do --------------------------------
+  # plan.md rule 7: the broker is output-only. It never reads
+  # /dev/input/event*, so a compromised uictld cannot become a keylogger
+  # by opening one. `deny` rather than mere absence, and audited, so an
+  # attempt is a log line rather than a silent EACCES that looks like a
+  # configuration mistake.
+  audit deny /dev/input/** rwklx,
+
+  # ---- no network, ever ----------------------------------------------
+  # plan.md rule 2, spelled out family by family rather than as a bare
+  # `deny network,`. That shorter version is a trap: AF_UNIX is a network
+  # family as far as that rule is concerned, so denying all of `network`
+  # can take the daemon's own socket with it depending on how AF_UNIX is
+  # mediated on the running kernel. Naming the families that have a wire
+  # behind them cannot make that mistake.
+  network unix,
+  audit deny network inet,
+  audit deny network inet6,
+  audit deny network netlink,
+  audit deny network packet,
+  audit deny network bluetooth,
+  audit deny network raw,
+
+  # ---- no subprocesses, ever -----------------------------------------
+  # plan.md forbids the daemon from fork()ing or exec()ing anything --
+  # that is why the confirmation prompter is a separate binary that
+  # connects, rather than something the daemon spawns. The code and the
+  # profile agree, and this is the half that survives the code being
+  # subverted.
+  audit deny /** x,
+
+  # ---- the listening socket ------------------------------------------
+  # Both spellings are needed: the filesystem node, and the AF_UNIX
+  # operations on it. Under socket activation systemd creates the node
+  # and passes the fd, so the daemon may never touch the path at all --
+  # but it does bind it when started by hand, and both paths have to
+  # work.
+  # `k` for the lock the kernel takes on a bound socket inode; `w` is
+  # what bind() needs to create the node. The `unix` rule below has no
+  # addr= condition because a filesystem-bound socket has no abstract
+  # address to match on -- the path rule above IS the mediation, and the
+  # unix rule only gates which operations are allowed at all.
+  owner @{run}/user/[0-9]*/uictld.sock rwk,
+  unix (bind, listen, accept, send, receive, getattr, getopt, setopt)
+       type=stream,
+
+  # systemd's readiness socket ($NOTIFY_SOCKET), which is a datagram
+  # socket in the abstract namespace. Send only: the daemon writes
+  # READY=1 and STOPPING=1 and never reads a reply.
+  unix (create, connect, send, getattr) type=dgram,
+
+  # ---- state: the audit log and the singleton lock -------------------
+  # `k` on both because the lock is flock()ed and the log is opened
+  # O_APPEND for the life of the process.
+  owner @{HOME}/.local/ w,
+  owner @{HOME}/.local/state/ w,
+  owner @{HOME}/.local/state/uictl/ rw,
+  owner @{HOME}/.local/state/uictl/audit.log rwk,
+  owner @{HOME}/.local/state/uictl/uictld.lock rwk,
+
+  # ---- config: read-only, and only these two files -------------------
+  # The client registry decides who gets elevated and the policy file
+  # decides which keycodes exist at all. Read-only from here: a daemon
+  # that could rewrite its own policy could grant itself keys.
+  owner @{HOME}/.config/uictl/ r,
+  owner @{HOME}/.config/uictl/clients r,
+  owner @{HOME}/.config/uictl/policy r,
+
+  # Everything else under the user's home is off limits. Listed
+  # explicitly rather than left to the default deny, because this is the
+  # rule a future "just let it read one more file" edit has to argue
+  # with.
+  audit deny @{HOME}/.ssh/** rwklx,
+  audit deny @{HOME}/.gnupg/** rwklx,
+
+  # ---- /proc: its own process and nothing else -----------------------
+  # M9 will want /proc/<peer-pid>/exe for per-binary identity. When it
+  # lands, the rule it needs is a read of one symlink and it should be
+  # added here explicitly rather than by widening the deny below.
+  owner @{PROC}/@{pid}/** r,
+  audit deny @{PROC}/[0-9]*/mem rwklx,
+
+  # ---- capabilities --------------------------------------------------
+  # None. The daemon runs as the user, with no setuid, no setcap and no
+  # root -- that is the whole premise of the project, and this is the
+  # line that says so where an auditor will look. Absence would deny
+  # them anyway; the explicit rule is documentation with teeth.
+  audit deny capability,
+
+  # ---- signals and ptrace --------------------------------------------
+  # Receive SIGTERM/SIGINT/SIGUSR1 from the user's own processes.
+  # Sending is not needed: the daemon signals nothing.
+  signal (receive) set=(term, int, usr1) peer=unconfined,
+  audit deny ptrace,
+}

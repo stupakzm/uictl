@@ -20,7 +20,23 @@ After=uictld.socket
 # an active-but-useless unit.
 Type=notify
 NotifyAccess=main
+# `make install-user` rewrites this line with the absolute path of the
+# checkout it is run from. The value below is only right for a checkout
+# at ~/projects/uictl; it is a real path rather than a placeholder so
+# that `systemd-analyze verify` can check this file as shipped.
 ExecStart=%h/projects/uictl/uictld
+
+# Exit after this many seconds with no connections, and let the socket
+# unit start a new instance on the next connect(). Off by default. The
+# daemon refuses values under 5 seconds, and ignores this entirely when
+# it was not socket-activated -- exiting with nothing to restart it
+# would take the socket down with the process.
+#
+# The cost is a cold start: exiting destroys the two virtual devices and
+# the next request pays their registration, which is most of a
+# latency-sensitive client's budget. Leave it off for muvor; consider it
+# where uictl is used occasionally.
+#Environment=UICTL_IDLE_EXIT_SEC=300
 
 # The daemon does not fork, does not setsid, and does not background
 # itself. plan.md keeps it in the foreground precisely so the supervisor

@@ -7,8 +7,7 @@
 # that membership" into "the broker needs more than the user has".
 #
 # Install:
-#   mkdir -p ~/.config/systemd/user
-#   cp systemd/uictld.socket systemd/uictld.service ~/.config/systemd/user/
+#   make install-user          # copies both units, fixing ExecStart
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now uictld.socket
 #

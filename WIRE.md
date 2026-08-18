@@ -2024,11 +2024,23 @@ blocked when this section was written have since landed, and both landed
 as the rule described rather than as a retrofit — which is what writing
 §8 before M6 and before `libuictl` was for.
 
-One consequence of socket activation is worth stating here rather than
-leaving to be discovered: under activation the socket file belongs to
-the `.socket` unit and **the daemon does not remove it on shutdown**. A
-daemon that unlinked it would leave the unit listening on an inode
-nothing can reach, so every later `connect()` would fail with
+Two consequences of socket activation are worth stating here rather than
+leaving to be discovered.
+
+**The daemon may not be running between your connections.** Under
+activation it is started by the first `connect()`, and it MAY be
+configured to exit again once no connections remain. A client therefore
+cannot assume that the pid it talked to last time is the pid it is
+talking to now, and MUST NOT treat a changed pid as an error. Nothing in
+§8 changes: the daemon only exits with an empty connection table, so it
+never disappears out from under a held key, and everything a client
+needs to re-establish is already covered by §8.4's mandatory re-HELLO.
+The observable cost is latency — the first request after an idle exit
+pays for the virtual devices being registered again.
+
+**The socket file belongs to the `.socket` unit**, and the daemon does
+not remove it on shutdown. A daemon that unlinked it would leave the
+unit listening on an inode nothing can reach, so every later `connect()` would fail with
 `ECONNREFUSED` and no restart of the *service* would fix it. A client
 seeing that should report it as an operator problem — the socket unit
 needs restarting — and not as a reason to retry forever.

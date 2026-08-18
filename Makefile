@@ -48,6 +48,36 @@ libuictl.so: $(LIB_SRCS) $(LIB_HDRS)
 	$(CC) $(filter-out -fPIE,$(CFLAGS)) -fPIC -shared $(LIB_SRCS) -o $@ \
 		$(filter-out -pie,$(LDFLAGS))
 
+# ---- user-scope systemd install (M6) --------------------------------
+# User units only. There is deliberately no system-wide install target:
+# the daemon runs as the user and its only privilege is `input` group
+# membership, and a system unit would have to run it as root or as a
+# dedicated user -- which turns "the broker is the only thing that needs
+# that membership" into "the broker needs more than the user has".
+#
+# ExecStart is rewritten rather than templated, so the file in systemd/
+# stays a valid unit that `systemd-analyze verify` can check as shipped.
+USER_UNIT_DIR ?= $(HOME)/.config/systemd/user
+
+install-user: uictld uictl uictl-confirm systemd/uictld.socket systemd/uictld.service
+	install -d -m 0755 $(USER_UNIT_DIR)
+	install -m 0644 systemd/uictld.socket $(USER_UNIT_DIR)/uictld.socket
+	sed -e 's|^ExecStart=.*|ExecStart=$(CURDIR)/uictld|' \
+	    -e 's|^Documentation=file:.*|Documentation=file:$(CURDIR)/WIRE.md|' \
+	    systemd/uictld.service > $(USER_UNIT_DIR)/uictld.service
+	chmod 0644 $(USER_UNIT_DIR)/uictld.service
+	@echo
+	@echo "installed to $(USER_UNIT_DIR), ExecStart=$(CURDIR)/uictld"
+	@echo "next:  systemctl --user daemon-reload"
+	@echo "       systemctl --user enable --now uictld.socket"
+	@echo
+	@echo "note:  enable the SOCKET, not the service. the socket exists"
+	@echo "       from login and the daemon starts on the first connect."
+
+uninstall-user:
+	rm -f $(USER_UNIT_DIR)/uictld.socket $(USER_UNIT_DIR)/uictld.service
+	@echo "removed the units. run: systemctl --user daemon-reload"
+
 # proto.json (M-lib task 3) -- the machine-readable schema. Generated,
 # committed, and checked: layout comes from src/proto.h, result classes
 # and hints come from libuictl by calling it, so the three consumers
@@ -65,7 +95,7 @@ proto.json: tests/gen_proto_json.c $(LIB_HDRS) libuictl.a
 gen-vectors: tests/gen_vectors.c src/proto.h
 	@$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) && ./$@ && rm -f $@
 
-.PHONY: all clean lib gen-vectors
+.PHONY: all clean lib gen-vectors install-user uninstall-user
 clean:
 	rm -f uictl uictld uictl-confirm gen-vectors \
 	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke \
