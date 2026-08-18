@@ -89,7 +89,7 @@ reconnect visible to its caller — see `src/lib/uictl.h`.
 | `src/lib/` | `libuictl` |
 | `src/uictl.c` | the CLI, and the library's first consumer |
 | `src/uictl-confirm.c` | the human-in-the-loop prompter |
-| `tests/` | 26 suites; `python3 tests/run_all.py` |
+| `tests/` | 27 suites; `python3 tests/run_all.py` |
 | `fuzz/` | libFuzzer harness over the real frame path |
 | `systemd/`, `apparmor/`, `packaging/` | deployment |
 

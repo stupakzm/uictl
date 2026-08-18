@@ -55,6 +55,7 @@ SUITES = [
     ("test_m5_confirm.py",       "own",    "confirmation: parked requests, fails closed, no source_tag"),
     ("test_m55_pointer.py",      "own",    "device split, buttons, rel/scroll, batch, audit coalescing"),
     ("test_m6_activation.py",    "own",    "M6: socket activation, Type=notify readiness, the shipped units"),
+    ("test_m6_idle.py",          "own",    "M6: idle exit is keyed on the connection table, and only under activation"),
     ("test_wire831_forgive.py",  "own",    "WIRE.md 8.3.1: the first release on a connection is forgiven"),
     ("test_wire87_storm.py",     "own",    "WIRE.md 8.7: the connection-attempt backstop"),
     ("test_wire5a_pointer.py",   "own",    "WIRE.md 5A: every normative claim about the pointer opcodes"),
@@ -85,6 +86,7 @@ MATRIX = [
     ("libuictl (M-lib 2)",        "test_mlib_lib.py"),
     ("proto.json (M-lib 3)",      "test_mlib_proto_json.py"),
     ("socket activation (M6)",    "test_m6_activation.py"),
+    ("idle exit (M6)",            "test_m6_idle.py"),
 ]
 
 

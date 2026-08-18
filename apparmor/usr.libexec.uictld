@@ -39,6 +39,17 @@
 #   ... run everything ...
 #   sudo aa-enforce  /etc/apparmor.d/usr.libexec.uictld
 #
+# aa-complain and aa-enforce ship in apparmor-utils, which is a separate
+# package from apparmor and is not installed by default on Debian 13.
+# apparmor_parser, which is in apparmor itself, does the same two things:
+#
+#   sudo apparmor_parser -r -C /etc/apparmor.d/usr.libexec.uictld   # complain
+#   sudo apparmor_parser -r    /etc/apparmor.d/usr.libexec.uictld   # enforce
+#
+# Prefer these when writing instructions someone else will follow: the
+# aa-* names are the ones people know, and the parser is the one that is
+# actually present.
+#
 # A profile that goes straight to enforce and is slightly too tight
 # presents as a daemon that starts and then fails at some request nobody
 # thought to try, hours later.
@@ -60,6 +71,34 @@ profile uictld /usr/libexec/uictld {
   # Read as well as write: the uinput protocol is ioctl-driven, and
   # UI_DEV_SETUP/UI_DEV_CREATE plus the sysname query are not writes.
   /dev/uinput rw,
+
+  # ---- what the kernel says it got -----------------------------------
+  # After UI_DEV_CREATE the daemon reads capabilities/ev to confirm the
+  # created device actually has the bits it asked for
+  # (verify_capabilities, src/platform/uinput.c) -- the ioctls only say
+  # what was requested. Found by the first complain-mode run, which is
+  # the whole argument for doing one: every ioctl above is allowed by the
+  # /dev/uinput rule, and this single small read is not, so under enforce
+  # the daemon would have failed at start-up with an open() on /sys.
+  #
+  # TWO THINGS ABOUT THIS RULE ARE EASY TO GET WRONG, and both were
+  # observed in the log rather than reasoned about:
+  #
+  #   the PATH. The code opens /sys/class/input/<sysname>/..., but
+  #   /sys/class/input/inputN is a symlink into /sys/devices, and
+  #   AppArmor mediates the RESOLVED path. A rule naming
+  #   /sys/class/input/** matches nothing. The denial named
+  #   /sys/devices/virtual/input/input569/capabilities/ev.
+  #
+  #   no `owner`. Every other file rule here is owner-prefixed. This one
+  #   must not be: the log shows fsuid=1000 ouid=0 -- the file belongs to
+  #   root, the daemon does not, and `owner` requires them to match. An
+  #   owner rule here would look right and deny.
+  #
+  # access(F_OK) on the parent directory (wait_for_device_ready) needs no
+  # rule: AppArmor does not mediate it, and the complain run confirms it
+  # -- nothing was logged for that path.
+  /sys/devices/virtual/input/input[0-9]*/capabilities/ev r,
 
   # ---- the one thing it must never do --------------------------------
   # plan.md rule 7: the broker is output-only. It never reads
