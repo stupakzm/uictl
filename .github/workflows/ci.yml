@@ -1,0 +1,126 @@
+# CI for uictl (M8, closes ydotool-analysis §B4).
+#
+# WHAT CI CAN AND CANNOT DO HERE. The Python suites in tests/ inject
+# input into a real /dev/uinput and read it back from /dev/input/event*.
+# A GitHub runner has neither a uinput device nor a session to inject
+# into, and loading the module to fake one would mean CI exercising a
+# code path no user has. So CI does not run them, and the README should
+# not pretend otherwise: the device suites are a developer's
+# responsibility, on a machine with a desktop.
+#
+# What CI does instead is everything that needs no device, which turns
+# out to be most of what catches regressions: the build with its
+# hardening flags, a check that those flags actually produced the
+# properties they promise, the static analyser, the sanitizers, the
+# fuzzer, and the two suites that check the spec against the code rather
+# than against a daemon.
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build everything
+        run: make -B all lib
+      - name: warnings are errors here even though they are not locally
+        # -Werror is deliberately NOT in the Makefile: a warning should
+        # not stop someone debugging at 1am. It should stop a merge.
+        run: make -B all lib CFLAGS=-Werror
+      - name: the hardening flags produced the hardening
+        # The flags are only a request. This checks the ELF actually came
+        # out with full RELRO, a PIE header, a non-executable stack and a
+        # stack protector -- which is what -fPIE in CFLAGS and -pie in
+        # LDFLAGS are for, and what swapping them silently loses.
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y binutils
+          fail=0
+          for b in uictld uictl uictl-confirm; do
+            echo "== $b"
+            readelf -d "$b" | grep -q 'BIND_NOW' || { echo "  no BIND_NOW"; fail=1; }
+            readelf -h "$b" | grep -q 'DYN (' || { echo "  not PIE"; fail=1; }
+            readelf -lW "$b" | grep -q 'GNU_RELRO' || { echo "  no RELRO"; fail=1; }
+            readelf -lW "$b" | grep 'GNU_STACK' | grep -q 'RWE' && { echo "  executable stack"; fail=1; }
+            readelf -sW "$b" | grep -q '__stack_chk_fail' || { echo "  no stack protector"; fail=1; }
+          done
+          exit $fail
+      - name: install into a staging root
+        # Catches the class of packaging bug that only appears at
+        # install time: a file listed in `install` that the build does
+        # not produce, or a unit whose ExecStart rewrite stopped
+        # matching.
+        run: |
+          make install DESTDIR="$PWD/stage"
+          test -x stage/usr/libexec/uictld
+          test -x stage/usr/bin/uictl
+          test -f stage/usr/lib/pkgconfig/uictl.pc
+          grep -q '^ExecStart=/usr/libexec/uictld$' \
+            stage/usr/lib/systemd/user/uictld.service
+
+  units:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the systemd units parse, and the socket is not world-writable
+        run: |
+          systemd-analyze --user verify systemd/uictld.socket systemd/uictld.service
+          grep -q '^SocketMode=0600$' systemd/uictld.socket
+      - name: the AppArmor profile parses
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y apparmor-utils
+          sudo apparmor_parser -QT apparmor/usr.libexec.uictld
+
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y clang-tools
+      - name: scan-build
+        # --status-bugs makes a finding a failure. Without it scan-build
+        # exits 0 and reports into a directory nobody opens.
+        run: scan-build --status-bugs make -B all lib
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build with ASan and UBSan
+        run: |
+          make -B all lib \
+            CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            LDFLAGS="-fsanitize=address,undefined"
+      - name: the spec-vs-code suites, which need no device
+        # These two check the document against the header and the daemon
+        # against the document. Both skip their daemon-dependent parts
+        # when nothing is listening, which is exactly the CI case.
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          python3 tests/test_wire9_vectors.py
+          python3 tests/test_mlib_proto_json.py
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y clang
+      - name: build the harness
+        run: make fuzz
+      - name: seed the corpus from WIRE.md §9
+        run: make fuzz-corpus
+      - name: a short campaign
+        # Short on purpose: this is a smoke test that the harness still
+        # builds and that the seed corpus still runs clean, not a
+        # substitute for a real campaign. A crash here is a real bug; an
+        # absence of crashes here proves very little, and the workflow
+        # should not imply otherwise.
+        run: ./fuzz-frame fuzz/corpus -runs=200000 -max_len=1024 -timeout=10
+      - name: the reproducer builds with a non-clang compiler too
+        run: make fuzz-frame-repro CC=gcc

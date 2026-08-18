@@ -1,0 +1,41 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    # Reload the profile if AppArmor is running. Not enabled or enforced
+    # here: switching a machine's confinement on during a package
+    # install is the administrator's call, and the profile ships in
+    # whatever mode the parser defaults to for a fresh load.
+    if [ -x /sbin/apparmor_parser ] && [ -d /sys/kernel/security/apparmor ]; then
+      /sbin/apparmor_parser -r -T -W /etc/apparmor.d/usr.libexec.uictld || true
+    fi
+    # User units are per-user; a package cannot enable them for people
+    # who are not logged in and should not try. Tell the administrator
+    # what the next step is instead of guessing at it.
+    cat <<'MSG'
+
+uictl is installed. Two things it deliberately did NOT do for you:
+
+  1. Add yourself to the `input` group, which is what lets uictld open
+     /dev/uinput:
+
+         sudo usermod -aG input $USER      # then log out and back in
+
+     The whole point of this broker is that this membership belongs to
+     it and to nothing else. If other programs of yours have it, take
+     it away from them.
+
+  2. Enable the socket, which is per-user:
+
+         systemctl --user enable --now uictld.socket
+
+     Enable the SOCKET, not the service: the socket exists from login
+     and the daemon starts on the first client connection.
+
+MSG
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

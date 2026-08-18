@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# The upstream Makefile already honours DESTDIR and the GNU *dir
+# variables, so dh's default install just works.
+#
+# The hardening block in the Makefile uses `override CFLAGS +=`, which
+# means dpkg-buildflags' flags come in and ours are appended rather than
+# replaced. That is the behaviour we want: the distribution's hardening
+# plus the project's, not one instead of the other.
+%:
+	dh $@
+
+override_dh_auto_test:
+	# The test suites inject into a real /dev/uinput and read it back
+	# from /dev/input/event*. A build daemon has neither, and a build
+	# that injected keystrokes into a machine it does not own would be
+	# a remarkable thing to ship. The device suites belong on a
+	# developer's desktop; CI runs the device-free ones.
+	python3 tests/test_wire9_vectors.py

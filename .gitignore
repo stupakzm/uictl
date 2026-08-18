@@ -6,8 +6,11 @@ uictl-confirm
 compile_flags.txt
 __pycache__/
 
-# WIRE.md is the product, not working notes — it ships.
+# WIRE.md is the product, not working notes — it ships. So is the
+# README, for the same reason: both are read by people who will never
+# see this repository's plan files.
 !WIRE.md
+!README.md
 
 # libuictl and the two generated build artefacts. `*.o` above already
 # covers src/lib/libuictl.o.
@@ -15,3 +18,17 @@ libuictl.a
 libuictl.so
 lib-smoke
 gen-vectors
+
+# M8 build artefacts: the fuzz binaries, the fuzzer's own findings, and
+# the staging root `make install DESTDIR=` writes into. fuzz/corpus is
+# generated from WIRE.md §9 by `make fuzz-corpus`, so it is regenerable
+# rather than source -- and a corpus that grew during a campaign is
+# machine-specific noise nobody should be reviewing in a diff.
+fuzz-frame
+fuzz-frame-repro
+fuzz/corpus/
+crash-*
+leak-*
+timeout-*
+oom-*
+/stage/

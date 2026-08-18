@@ -48,6 +48,81 @@ libuictl.so: $(LIB_SRCS) $(LIB_HDRS)
 	$(CC) $(filter-out -fPIE,$(CFLAGS)) -fPIC -shared $(LIB_SRCS) -o $@ \
 		$(filter-out -pie,$(LDFLAGS))
 
+# ---- system install (M8) ---------------------------------------------
+# The split closes ydotool-analysis §B5. The daemon goes to libexecdir,
+# not bindir, and that is not tidiness: /usr/libexec is for programs
+# started by other programs, and uictld is started by systemd or by a
+# developer, never typed by a user. Putting it on $PATH invites someone
+# to run a second copy by hand next to the socket-activated one -- which
+# the flock singleton refuses, but only after both have been started and
+# one has confused somebody.
+#
+# It is also the path M7's AppArmor profile attaches to. A profile keys
+# on the executable's path, so until the daemon lives at
+# /usr/libexec/uictld the profile confines nothing.
+#
+# DESTDIR and the *dir variables follow the GNU conventions so a
+# packager can stage into a build root without patching this file.
+prefix ?= /usr
+exec_prefix ?= $(prefix)
+bindir ?= $(exec_prefix)/bin
+libexecdir ?= $(exec_prefix)/libexec
+libdir ?= $(exec_prefix)/lib
+includedir ?= $(prefix)/include
+datarootdir ?= $(prefix)/share
+datadir ?= $(datarootdir)
+sysconfdir ?= /etc
+# Units shipped by a package go under $(prefix)/lib, never /etc: /etc is
+# the administrator's, and a package that writes there takes away their
+# ability to override.
+systemduserdir ?= $(prefix)/lib/systemd/user
+apparmordir ?= $(sysconfdir)/apparmor.d
+
+INSTALL ?= install
+
+install: all lib proto.json
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(libexecdir)
+	$(INSTALL) -m 0755 uictld $(DESTDIR)$(libexecdir)/uictld
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(bindir)
+	$(INSTALL) -m 0755 uictl $(DESTDIR)$(bindir)/uictl
+	$(INSTALL) -m 0755 uictl-confirm $(DESTDIR)$(bindir)/uictl-confirm
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(libdir)
+	$(INSTALL) -m 0644 libuictl.a $(DESTDIR)$(libdir)/libuictl.a
+	$(INSTALL) -m 0755 libuictl.so $(DESTDIR)$(libdir)/libuictl.so
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(includedir)/uictl
+	$(INSTALL) -m 0644 src/lib/uictl.h $(DESTDIR)$(includedir)/uictl/uictl.h
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(libdir)/pkgconfig
+	sed -e 's|@prefix@|$(prefix)|g' -e 's|@libdir@|$(libdir)|g' \
+	    -e 's|@includedir@|$(includedir)|g' \
+	    packaging/uictl.pc.in > $(DESTDIR)$(libdir)/pkgconfig/uictl.pc
+	chmod 0644 $(DESTDIR)$(libdir)/pkgconfig/uictl.pc
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(datadir)/uictl
+	$(INSTALL) -m 0644 proto.json $(DESTDIR)$(datadir)/uictl/proto.json
+	$(INSTALL) -m 0644 WIRE.md $(DESTDIR)$(datadir)/uictl/WIRE.md
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(systemduserdir)
+	$(INSTALL) -m 0644 systemd/uictld.socket \
+	  $(DESTDIR)$(systemduserdir)/uictld.socket
+	sed -e 's|^ExecStart=.*|ExecStart=$(libexecdir)/uictld|' \
+	    -e 's|^Documentation=file:.*|Documentation=file:$(datadir)/uictl/WIRE.md|' \
+	    systemd/uictld.service > $(DESTDIR)$(systemduserdir)/uictld.service
+	chmod 0644 $(DESTDIR)$(systemduserdir)/uictld.service
+	$(INSTALL) -d -m 0755 $(DESTDIR)$(apparmordir)
+	$(INSTALL) -m 0644 apparmor/usr.libexec.uictld \
+	  $(DESTDIR)$(apparmordir)/usr.libexec.uictld
+
+uninstall:
+	rm -f $(DESTDIR)$(libexecdir)/uictld
+	rm -f $(DESTDIR)$(bindir)/uictl $(DESTDIR)$(bindir)/uictl-confirm
+	rm -f $(DESTDIR)$(libdir)/libuictl.a $(DESTDIR)$(libdir)/libuictl.so
+	rm -f $(DESTDIR)$(libdir)/pkgconfig/uictl.pc
+	rm -f $(DESTDIR)$(includedir)/uictl/uictl.h
+	rm -f $(DESTDIR)$(datadir)/uictl/proto.json
+	rm -f $(DESTDIR)$(datadir)/uictl/WIRE.md
+	rm -f $(DESTDIR)$(systemduserdir)/uictld.socket
+	rm -f $(DESTDIR)$(systemduserdir)/uictld.service
+	rm -f $(DESTDIR)$(apparmordir)/usr.libexec.uictld
+	-rmdir $(DESTDIR)$(includedir)/uictl $(DESTDIR)$(datadir)/uictl 2>/dev/null
+
 # ---- user-scope systemd install (M6) --------------------------------
 # User units only. There is deliberately no system-wide install target:
 # the daemon runs as the user and its only privilege is `input` group
@@ -88,6 +163,44 @@ proto.json: tests/gen_proto_json.c $(LIB_HDRS) libuictl.a
 		&& ./gen-proto-json > $@ && rm -f gen-proto-json
 	@echo "wrote $@"
 
+# ---- fuzzing (M8, closes analysis §B3) -------------------------------
+# The harness #includes src/uictld.c so it can reach the daemon's static
+# functions and drive the REAL frame path. Both device fds point at
+# /dev/null, so nothing is injected and this is safe on a desktop and in
+# CI, where there is no /dev/uinput at all.
+#
+# clang only, because -fsanitize=fuzzer is a clang feature. The
+# reproducer below builds with any compiler for the case where the
+# machine that hit a crash is not the machine with clang on it.
+FUZZ_CC ?= clang
+FUZZ_CFLAGS ?= -D_GNU_SOURCE -std=c11 -g -O1 -Wall -Wextra \
+	-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
+
+fuzz: fuzz-frame
+
+fuzz-frame: fuzz/fuzz_frame.c $(UICTLD_SRCS) $(UICTLD_HDRS)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) -I src fuzz/fuzz_frame.c \
+		src/platform/uinput.c -o $@
+
+# No sanitizer and no libFuzzer: replays files named on the command line.
+fuzz-frame-repro: fuzz/fuzz_frame.c $(UICTLD_SRCS) $(UICTLD_HDRS)
+	$(CC) -D_GNU_SOURCE -std=c11 -g -Wall -DUICTL_FUZZ_STANDALONE \
+		-I src fuzz/fuzz_frame.c src/platform/uinput.c -o $@
+
+# Seeds the corpus from WIRE.md §9's vectors. Real frames reach the
+# opcode handlers on the first run; random bytes spend the early campaign
+# failing the header check.
+fuzz-corpus:
+	@mkdir -p fuzz/corpus
+	@python3 fuzz/seed_corpus.py
+
+# ---- static analysis --------------------------------------------------
+# scan-build over the daemon, the library and both clients. Kept as a
+# target rather than a CI-only invocation so it can be run before
+# pushing, which is when a finding is cheap.
+analyze:
+	scan-build --status-bugs $(MAKE) -B all lib
+
 # WIRE.md §9's conformance vectors are generated from src/proto.h rather
 # than typed, so a field that moves in the header moves in the document.
 # Not part of `all`: it is a documentation tool, not a shipped binary,
@@ -95,8 +208,9 @@ proto.json: tests/gen_proto_json.c $(LIB_HDRS) libuictl.a
 gen-vectors: tests/gen_vectors.c src/proto.h
 	@$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) && ./$@ && rm -f $@
 
-.PHONY: all clean lib gen-vectors install-user uninstall-user
+.PHONY: all clean lib gen-vectors install uninstall \
+	 install-user uninstall-user fuzz fuzz-corpus analyze
 clean:
 	rm -f uictl uictld uictl-confirm gen-vectors \
 	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke \
-	  gen-proto-json
+	  gen-proto-json fuzz-frame fuzz-frame-repro

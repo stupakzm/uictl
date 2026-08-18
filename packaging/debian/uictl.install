@@ -1,0 +1,8 @@
+usr/libexec/uictld
+usr/bin/uictl
+usr/bin/uictl-confirm
+usr/lib/systemd/user/uictld.socket
+usr/lib/systemd/user/uictld.service
+usr/share/uictl/proto.json
+usr/share/uictl/WIRE.md
+etc/apparmor.d/usr.libexec.uictld

@@ -1,0 +1,52 @@
+Building distribution packages
+==============================
+
+Debian / Ubuntu
+---------------
+
+debhelper expects debian/ at the top of the source tree, and this repo
+keeps packaging out of the root so that a checkout looks like source
+rather than like a package. So the directory is copied into place for a
+build and removed afterwards:
+
+    cp -r packaging/debian debian
+    dpkg-buildpackage -us -uc -b
+    rm -rf debian
+
+Two packages come out: `uictl` (daemon, clients, units, AppArmor
+profile) and `libuictl-dev` (header, static and shared library,
+pkg-config file).
+
+Fedora / RHEL
+-------------
+
+    VERSION=0.3.0
+    git archive --format=tar.gz --prefix=uictl-$VERSION/ \
+        -o ~/rpmbuild/SOURCES/uictl-$VERSION.tar.gz HEAD
+    rpmbuild -ba packaging/uictl.spec
+
+
+What the packages deliberately do NOT do
+----------------------------------------
+
+1. Add anyone to the `input` group. That membership is the privilege
+   this whole project exists to concentrate in one binary, and a package
+   that handed it out on install would be undoing its own purpose. The
+   postinst says so and stops there.
+
+2. Enable the socket unit. It is a *user* unit, and a package installing
+   for the whole machine cannot meaningfully enable something per-user
+   for people who are not logged in.
+
+3. Enforce the AppArmor profile. It is loaded on install if AppArmor is
+   running; switching a machine's confinement into enforce mode during a
+   package install is the administrator's decision. Start it in complain
+   mode and read the denials first -- see the header of
+   apparmor/usr.libexec.uictld.
+
+Neither packaging runs the device test suites at build time. They inject
+into a real /dev/uinput and read the result back from
+/dev/input/event*, which a build host does not have -- and a build that
+typed into a machine it does not own would be a remarkable thing to
+ship. The device-free suites do run: they check the specification
+against the headers and the generated schema against both.

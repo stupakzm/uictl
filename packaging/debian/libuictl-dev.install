@@ -1,0 +1,4 @@
+usr/include/uictl/uictl.h
+usr/lib/*/libuictl.a
+usr/lib/*/libuictl.so
+usr/lib/*/pkgconfig/uictl.pc

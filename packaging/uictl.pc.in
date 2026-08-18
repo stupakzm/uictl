@@ -1,0 +1,10 @@
+prefix=@prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: libuictl
+Description: C client library for the uictl input broker
+URL: https://github.com/stupakzm/uictl
+Version: 0.3.0
+Libs: -L${libdir} -luictl
+Cflags: -I${includedir}/uictl
