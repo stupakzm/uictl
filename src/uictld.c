@@ -62,6 +62,23 @@ static const char *opname(uint16_t op) {
   }
 }
 
+/* Create one directory at 0700, reporting the first time it appears.
+
+   Saying so on stderr is not chatter: this is the daemon quietly
+   creating something under a user's home, and the one moment that is
+   worth a line is the moment it happens. It also tells an operator
+   where the audit log and the singleton lock went to live. */
+static int mkdir_0700(const char *path, const char *what) {
+  if (mkdir(path, 0700) == 0) {
+    fprintf(stderr, "uictld: created %s (%s), mode 0700\n", path, what);
+    return 0;
+  }
+  if (errno == EEXIST)
+    return 0;
+  fprintf(stderr, "uictld: mkdir %s: %s\n", path, strerror(errno));
+  return -1;
+}
+
 static int prepare_state_dir(char *out, size_t outlen) {
   const char *home = getenv("HOME");
   if (!home) {
@@ -73,10 +90,43 @@ static int prepare_state_dir(char *out, size_t outlen) {
     fprintf(stderr, "uictld: state dir path too long\n");
     return -1;
   }
-  if (mkdir(out, 0700) < 0 && errno != EEXIST) {
-    perror("uictld: mkdir state dir");
+
+  /* The whole path, not just the leaf. A single mkdir() fails with
+     ENOENT on any account that has never had a ~/.local/state -- a fresh
+     user, a system account, a test running with HOME in a temp dir --
+     and the daemon then refuses to start for a reason that reads like a
+     permissions problem. Socket activation (M6) makes this sharper
+     still: the first start now happens on somebody's first login, not
+     when a developer runs ./uictld by hand.
+
+     It is also the honest fix rather than the convenient one. Eight test
+     suites currently create ~/.local/state themselves before starting a
+     daemon, which is eight copies of a workaround for this function --
+     and a workaround that lives in the callers is a bug that never gets
+     found by the callers who are not tests.
+
+     Intermediates are 0700 like the leaf. ~/.local is more usually
+     0755, but this daemon's whole posture is that nothing it creates is
+     readable by anyone else, and a user who wants it looser can chmod
+     it. Creating it tighter than needed is the mistake that is easy to
+     undo. */
+  char parent[256];
+  int p = snprintf(parent, sizeof(parent), "%s/.local", home);
+  if (p < 0 || (size_t)p >= sizeof(parent)) {
+    fprintf(stderr, "uictld: state dir path too long\n");
     return -1;
   }
+  if (mkdir_0700(parent, "XDG base") < 0)
+    return -1;
+  p = snprintf(parent, sizeof(parent), "%s/.local/state", home);
+  if (p < 0 || (size_t)p >= sizeof(parent)) {
+    fprintf(stderr, "uictld: state dir path too long\n");
+    return -1;
+  }
+  if (mkdir_0700(parent, "XDG state home") < 0)
+    return -1;
+  if (mkdir_0700(out, "uictld state: audit log and singleton lock") < 0)
+    return -1;
   struct stat st;
   if (stat(out, &st) < 0) {
     perror("uictld: stat state dir");
@@ -3677,6 +3727,246 @@ static void conn_dump_table(void) {
   fflush(stderr);
 }
 
+/* ---- socket activation (M6) -----------------------------------------
+   systemd's protocol, implemented by hand rather than by linking
+   libsystemd: LISTEN_PID names the process the fds were passed to,
+   LISTEN_FDS counts them, and they begin at fd 3.
+
+   Why not the library. It is ~60 lines against a shared-object
+   dependency in the most security-sensitive binary in the stack, for a
+   protocol that is three environment variables and has not changed
+   since 2010. The M7 AppArmor profile also stays smaller with one fewer
+   object to allow, and plan.md's "no license-incompatible deps" is
+   easier to keep true when there are none. */
+#define SD_LISTEN_FDS_START 3
+
+/* Set when systemd handed us the listening socket. The daemon then does
+   NOT own the socket file. */
+static int g_socket_inherited;
+
+/* Remove the socket file — unless systemd created it.
+
+   Under socket activation the .socket unit owns that path and outlives
+   this process. Unlinking it on shutdown would leave the unit listening
+   on an inode nothing can reach: every later connect() gets
+   ECONNREFUSED, and no restart of the *service* fixes it, because the
+   stale listener belongs to the socket unit. That is a failure the user
+   has to diagnose with `systemctl --user status`, which is exactly the
+   class of restart bug WIRE.md §8 exists to prevent. */
+static void socket_path_cleanup(const char *path) {
+  if (g_socket_inherited)
+    return;
+  unlink(path);
+}
+
+/* Is the socket file systemd created safe to serve on?
+
+   The obvious check does not work, and the reason is worth stating:
+   fstat() on a bound AF_UNIX socket fd reports the *sockfs* inode, not
+   the filesystem node, and that inode's mode is 0777 no matter what the
+   path's mode is. Verified by measurement rather than assumed. So the
+   real check is getsockname() to learn the path, then stat() on it.
+
+   This matters because the mode is not ours to set here: systemd creates
+   the node, and its SocketMode default is **0666**. A unit that forgets
+   `SocketMode=0600` produces a world-writable input broker — the single
+   worst outcome this project exists to prevent — and it would do so
+   silently, since everything works. Refusing to start is the only
+   honest response. */
+static int inherited_socket_path_ok(int fd, char *out, size_t outlen) {
+  struct sockaddr_un sa;
+  socklen_t len = sizeof(sa);
+  memset(&sa, 0, sizeof(sa));
+  if (getsockname(fd, (struct sockaddr *)&sa, &len) < 0) {
+    perror("uictld: getsockname on the inherited socket");
+    return -1;
+  }
+  if (len <= (socklen_t)offsetof(struct sockaddr_un, sun_path) ||
+      sa.sun_path[0] == '\0') {
+    /* Unnamed, or the abstract namespace. Abstract sockets have no
+       filesystem entry and therefore no permissions at all: anyone on
+       the system could connect. plan.md rules them out for exactly this
+       reason, and a ListenStream=@uictld in a unit file would otherwise
+       reintroduce it without touching a line of C. */
+    fprintf(stderr, "uictld: the inherited socket is not a filesystem "
+                    "path\n  fix:  ListenStream= must be a path. an "
+                    "abstract socket (@name) has no\n        permissions "
+                    "— any user on the system could connect.\n");
+    return -1;
+  }
+  sa.sun_path[sizeof(sa.sun_path) - 1] = '\0';
+
+  struct stat st;
+  if (stat(sa.sun_path, &st) < 0) {
+    perror("uictld: stat the inherited socket path");
+    return -1;
+  }
+  if (!S_ISSOCK(st.st_mode)) {
+    fprintf(stderr, "uictld: %s is not a socket\n", sa.sun_path);
+    return -1;
+  }
+  if (st.st_uid != getuid()) {
+    fprintf(stderr, "uictld: %s is owned by uid %u, not %u\n", sa.sun_path,
+            (unsigned)st.st_uid, (unsigned)getuid());
+    return -1;
+  }
+  if (st.st_mode & 0077) {
+    fprintf(stderr,
+            "uictld: %s has mode %04o — group or world bits are set\n"
+            "  why:  systemd's SocketMode default is 0666, which would let "
+            "any user\n        on this machine inject input\n"
+            "  fix:  add `SocketMode=0600` to the [Socket] section of "
+            "uictld.socket,\n        then `systemctl --user daemon-reload "
+            "&& systemctl --user restart uictld.socket`.\n",
+            sa.sun_path, (unsigned)(st.st_mode & 07777));
+    return -1;
+  }
+
+  int n = snprintf(out, outlen, "%s", sa.sun_path);
+  if (n < 0 || (size_t)n >= outlen) {
+    fprintf(stderr, "uictld: inherited socket path too long\n");
+    return -1;
+  }
+  return 0;
+}
+
+/* ---- readiness notification (M6, Type=notify) ------------------------
+   sd_notify by hand, for the same reasons as the fd protocol above: one
+   datagram to the socket named by $NOTIFY_SOCKET.
+
+   Why Type=notify rather than Type=simple. With `simple`, systemd
+   considers the unit started the moment fork() returns, so anything
+   ordered After=uictld.service races the daemon's actual readiness --
+   and "ready" here means the uinput devices are registered and the
+   accept loop is running, which is tens of milliseconds and a possible
+   EACCES away from process start. With `notify`, `systemctl --user
+   start` blocks until the daemon says it can serve, and a start-up
+   failure is reported as a failure instead of a unit that is
+   "active" and useless.
+
+   Absent NOTIFY_SOCKET this is a no-op, which is the normal case when
+   someone runs ./uictld in a terminal. Failure to notify is NOT fatal:
+   the daemon works fine unsupervised, and refusing to run because the
+   supervisor's socket is missing would make the manual case depend on
+   systemd. */
+static void notify_systemd(const char *msg) {
+  const char *sock = getenv("NOTIFY_SOCKET");
+  if (!sock || !*sock)
+    return;
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  size_t len = strlen(sock);
+  if (len >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "uictld: NOTIFY_SOCKET path too long\n");
+    return;
+  }
+  memcpy(addr.sun_path, sock, len);
+  /* systemd's notify socket is usually in the abstract namespace, where
+     it is spelled with a leading '@' in the variable and a leading NUL
+     on the wire. Abstract is fine HERE and nowhere else in this project:
+     we are the client, the socket is systemd's, and the rule against
+     abstract sockets is about what we would expose, not what we
+     connect to. */
+  if (addr.sun_path[0] == '@')
+    addr.sun_path[0] = '\0';
+
+  int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    perror("uictld: socket for NOTIFY_SOCKET");
+    return;
+  }
+  socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + len);
+  if (sendto(fd, msg, strlen(msg), MSG_NOSIGNAL, (struct sockaddr *)&addr,
+             alen) < 0)
+    perror("uictld: notify systemd");
+  close(fd);
+}
+
+/* Returns the inherited listening fd, -1 if we were not socket-activated,
+   or -2 if we were and something about it is wrong (fatal — falling back
+   to binding our own socket would race the one systemd is holding). */
+static int listen_fd_from_systemd(char *pathbuf, size_t pathlen) {
+  const char *pid_s = getenv("LISTEN_PID");
+  const char *fds_s = getenv("LISTEN_FDS");
+  if (!pid_s || !fds_s)
+    return -1;
+
+  errno = 0;
+  char *end;
+  long claimed_pid = strtol(pid_s, &end, 10);
+  if (errno != 0 || *end != '\0' || claimed_pid <= 0)
+    return -1;
+  /* LISTEN_PID exists precisely so that an inherited environment does
+     not convince a grandchild that fd 3 is its listening socket. We
+     never fork, but honouring it costs one comparison and makes the
+     variables meaningless to anything we did not start. */
+  if ((pid_t)claimed_pid != getpid())
+    return -1;
+
+  errno = 0;
+  long count = strtol(fds_s, &end, 10);
+  if (errno != 0 || *end != '\0')
+    return -1;
+  if (count != 1) {
+    fprintf(stderr,
+            "uictld: systemd passed %ld file descriptors, expected exactly "
+            "1\n  fix:  uictld.socket must declare a single "
+            "ListenStream=.\n",
+            count);
+    return -2;
+  }
+
+  int fd = SD_LISTEN_FDS_START;
+
+  /* Do not trust the environment about what fd 3 IS. These three
+     getsockopts turn "the unit file is wrong" into a clear refusal
+     instead of an accept() loop on something that is not a listening
+     unix socket. */
+  int val = 0;
+  socklen_t vlen = sizeof(val);
+  if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &val, &vlen) < 0 || !val) {
+    fprintf(stderr, "uictld: fd 3 is not a listening socket\n");
+    return -2;
+  }
+  vlen = sizeof(val);
+  if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &val, &vlen) < 0 ||
+      val != AF_UNIX) {
+    fprintf(stderr, "uictld: fd 3 is not AF_UNIX\n"
+                    "  why:  this daemon has no network surface, by "
+                    "design.\n");
+    return -2;
+  }
+  vlen = sizeof(val);
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &val, &vlen) < 0 ||
+      val != SOCK_STREAM) {
+    fprintf(stderr, "uictld: fd 3 is not SOCK_STREAM\n");
+    return -2;
+  }
+
+  if (inherited_socket_path_ok(fd, pathbuf, pathlen) < 0)
+    return -2;
+
+  /* systemd passes the fd blocking and without CLOEXEC; the accept loop
+     needs the first and the rest of the daemon assumes the second. */
+  int fl = fcntl(fd, F_GETFL, 0);
+  if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0 ||
+      fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+    perror("uictld: fcntl on the inherited socket");
+    return -2;
+  }
+
+  /* Clear the variables so they mean nothing to anything downstream.
+     Hygiene rather than necessity — the daemon never execs — but a stale
+     LISTEN_FDS in an environment is the kind of thing that confuses the
+     next program someone runs from a debugger. */
+  unsetenv("LISTEN_PID");
+  unsetenv("LISTEN_FDS");
+  unsetenv("LISTEN_FDNAMES");
+  return fd;
+}
+
 int main(void) {
 
   /* First thing, before any fd exists: a pure-logic check with nothing
@@ -3702,18 +3992,31 @@ int main(void) {
   }
 
   umask(0077);
-  /* SOCK_NONBLOCK on the LISTENING socket. accept4()'s flag argument
-     applies to the socket it returns, not to the one it is called on —
-     without this, the accept-until-EAGAIN loop blocks forever on its
-     second iteration and the daemon never reaches epoll_wait again. */
-  int sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-  if (sfd < 0) {
-    perror("uictld: socket");
+
+  /* Socket activation first (M6). If systemd is holding the listening
+     socket we must NOT create one: binding our own would either fail on
+     a path that already exists or, worse, replace the inode the socket
+     unit is listening on, leaving every queued connection unreachable.
+     There is deliberately no fallback from -2 for the same reason —
+     "activated but misconfigured" is not a state to improvise in. */
+  int sfd = listen_fd_from_systemd(path, sizeof(path));
+  if (sfd == -2)
     return 1;
-  }
+  g_socket_inherited = (sfd >= 0);
 
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
-  strcpy(addr.sun_path, path);
+  if (!g_socket_inherited) {
+    /* SOCK_NONBLOCK on the LISTENING socket. accept4()'s flag argument
+       applies to the socket it returns, not to the one it is called on —
+       without this, the accept-until-EAGAIN loop blocks forever on its
+       second iteration and the daemon never reaches epoll_wait again. */
+    sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (sfd < 0) {
+      perror("uictld: socket");
+      return 1;
+    }
+    strcpy(addr.sun_path, path);
+  }
 
   sigset_t mask;
   sigemptyset(&mask);
@@ -3778,28 +4081,34 @@ int main(void) {
     return 1;
   }
 
-  if (unlink(path) < 0 && errno != ENOENT) {
-    perror("uictld: unlink");
-    close(audit_fd);
-    close(lockfd);
-    close(sfd);
-    return 1;
-  }
+  /* All of this is systemd's job under activation: it created the node,
+     bound it and called listen() before we were started. The unlink is
+     safe here only because the flock above has already established that
+     no other daemon is live. */
+  if (!g_socket_inherited) {
+    if (unlink(path) < 0 && errno != ENOENT) {
+      perror("uictld: unlink");
+      close(audit_fd);
+      close(lockfd);
+      close(sfd);
+      return 1;
+    }
 
-  if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("uictld: bind");
-    close(audit_fd);
-    close(sfd);
-    return 1;
-  }
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+      perror("uictld: bind");
+      close(audit_fd);
+      close(sfd);
+      return 1;
+    }
 
-  if (listen(sfd, 16) < 0) {
-    perror("uictld: listen");
-    close(audit_fd);
-    close(lockfd);
-    close(sfd);
-    unlink(path);
-    return 1;
+    if (listen(sfd, 16) < 0) {
+      perror("uictld: listen");
+      close(audit_fd);
+      close(lockfd);
+      close(sfd);
+      unlink(path);
+      return 1;
+    }
   }
 
   uint32_t hal_caps = 0;
@@ -3809,7 +4118,7 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    unlink(path);
+    socket_path_cleanup(path);
     return 1;
   }
 
@@ -3824,7 +4133,7 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    unlink(path);
+    socket_path_cleanup(path);
     return 1;
   }
   /* Two devices since M5.5, and the fds are named so an operator can
@@ -3844,7 +4153,7 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    unlink(path);
+    socket_path_cleanup(path);
     return 1;
   }
 
@@ -3856,7 +4165,7 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    unlink(path);
+    socket_path_cleanup(path);
     return 1;
   }
   /* CLOCK_MONOTONIC, not CLOCK_REALTIME: an NTP step or a settimeofday
@@ -3871,7 +4180,7 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    unlink(path);
+    socket_path_cleanup(path);
     return 1;
   }
   /* it_value arms the first expiry, it_interval makes it periodic. Leave
@@ -3888,7 +4197,7 @@ int main(void) {
     close(audit_fd);
     close(lockfd);
     close(sfd);
-    unlink(path);
+    socket_path_cleanup(path);
     return 1;
   }
 
@@ -3909,6 +4218,27 @@ int main(void) {
 
   printf("uictld: listening on %s\n", path);
   fflush(stdout);
+
+  /* WIRE.md §8.8 requires the socket-activated case to be visible
+     specifically, not just "started". The two are operationally
+     different: an activated daemon appeared because somebody connected,
+     which means a client is already waiting on this pid, and it did not
+     create the socket file it is serving — so `rm` on that path is a
+     mistake here in a way it is not otherwise. Naming it also tells an
+     operator which half to restart when something is wrong: the service,
+     or the socket unit that owns the listener. */
+  if (g_socket_inherited)
+    fprintf(stderr,
+            "uictld: socket-activated — systemd owns %s and this process "
+            "does not remove it\n",
+            path);
+
+  /* Ready means a client may connect and expect service: the devices are
+     registered, the epoll set is armed and the accept loop is about to
+     run. Sent here and not one line earlier — everything above can still
+     fail, and telling the supervisor "ready" before that would turn a
+     start-up failure into a unit that is active and broken. */
+  notify_systemd("READY=1\n");
 
   /* WIRE.md §8.8. On stderr, not stdout, because that is what the
      journal captures under Type=notify and because a restart is
@@ -4092,12 +4422,18 @@ int main(void) {
     if (conns[i].fd >= 0)
       conn_close(epfd, &conns[i], devs, audit_fd);
 
+  /* Before the teardown, not after: STOPPING=1 tells systemd the exit is
+     deliberate, so a shutdown that then takes a moment to release held
+     keys reads as a clean stop rather than a daemon that stopped
+     answering. */
+  notify_systemd("STOPPING=1\n");
+
   uinput_close(&devices);
   close(tfd);
   close(sigfd);
   close(epfd);
   close(sfd);
-  unlink(path);
+  socket_path_cleanup(path);
   close(audit_fd);
   close(lockfd);
   return 0;

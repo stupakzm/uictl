@@ -1,0 +1,43 @@
+# uictl input broker — the listening socket.
+#
+# User scope, deliberately: `systemctl --user`, never a system unit.
+# The daemon runs as the user and its only privilege is `input` group
+# membership. A system-wide unit would run it as root or as a dedicated
+# user, and either one turns "the broker is the only thing that needs
+# that membership" into "the broker needs more than the user has".
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/uictld.socket systemd/uictld.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now uictld.socket
+#
+# Note what is enabled: the SOCKET, not the service. That is the point of
+# activation — the socket exists from login, the daemon starts on the
+# first connect(), and a client never has to know whether it is running.
+
+[Unit]
+Description=uictl input broker socket
+Documentation=file:%h/projects/uictl/WIRE.md
+
+[Socket]
+# %t is $XDG_RUNTIME_DIR for a user unit. Not /run/uictld.sock (needs
+# root) and not an abstract socket (@uictld has no filesystem
+# permissions — any user on the system could connect).
+ListenStream=%t/uictld.sock
+
+# NOT OPTIONAL. systemd's default is 0666, which would be a
+# world-writable input broker: any user on this machine could type into
+# this session. uictld refuses to start if it inherits a socket with any
+# group or world bit set, so getting this wrong fails loudly at start
+# rather than silently at 3am — but the right value belongs here.
+SocketMode=0600
+
+# One daemon serving many connections, not one process per connection.
+# Accept=yes would fork a process per client, which this daemon cannot
+# do anything sensible with: held-key state, the connection table and the
+# single confirmation slot are all daemon-wide.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

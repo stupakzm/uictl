@@ -1,0 +1,72 @@
+# uictl input broker — the daemon.
+#
+# Started by uictld.socket on the first client connection; see that file
+# for installation. Starting this unit directly also works and is what
+# `systemctl --user start uictld` does, but then the socket unit must
+# already own the listener, hence Requires=.
+
+[Unit]
+Description=uictl input broker (uictld)
+Documentation=file:%h/projects/uictl/WIRE.md
+Requires=uictld.socket
+After=uictld.socket
+
+[Service]
+# The daemon sends READY=1 once the uinput devices are registered and
+# the accept loop is armed. With Type=simple, systemd would call the
+# unit started the moment fork() returned — tens of milliseconds and one
+# possible EACCES before the daemon can actually serve — so anything
+# ordered after it would race, and a start-up failure would present as
+# an active-but-useless unit.
+Type=notify
+NotifyAccess=main
+ExecStart=%h/projects/uictl/uictld
+
+# The daemon does not fork, does not setsid, and does not background
+# itself. plan.md keeps it in the foreground precisely so the supervisor
+# owns the process lifecycle; Type=notify is what makes that a feature
+# rather than a limitation.
+
+# On restart every connection dies, and with it every held key (WIRE.md
+# §8.3). That is safe — the daemon releases what it holds — but it is
+# visible to clients, so do not restart casually.
+Restart=on-failure
+RestartSec=1s
+
+# --- hardening -------------------------------------------------------
+# Defence in depth, and none of it is a substitute for M7's AppArmor
+# profile: these are systemd's coarse switches, the profile is the
+# fine-grained one.
+#
+# NoNewPrivileges is the one that matters most here: it makes it
+# impossible for anything this daemon runs to gain privilege, which
+# matters because plan.md forbids the daemon from ever exec()ing at all.
+# The switch and the code agree.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# ...except its own state directory, which holds the audit log and the
+# singleton lock and must stay writable.
+ReadWritePaths=%h/.local/state/uictl
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# No network of any kind. plan.md's rule 2 is "no network surface,
+# ever"; this is the kernel enforcing it rather than the code promising
+# it. AF_UNIX only.
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+# /dev/uinput is the whole reason this daemon exists. DevicePolicy=closed
+# plus one allow means the daemon cannot open /dev/input/event* even if
+# it were told to — which is the "no keylogging surface" rule (plan.md
+# rule 7) enforced from outside the process.
+DevicePolicy=closed
+DeviceAllow=/dev/uinput rw
+
+[Install]
+WantedBy=default.target

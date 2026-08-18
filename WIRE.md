@@ -2015,18 +2015,23 @@ implemented in daemon 0.3.0 except where noted.
 | 8.5 no replay | client-side rule; no daemon change needed |
 | 8.6 advertised reconnect policy | shipped — HELLO response is 32 bytes; `tests/test_m36_identity.py` GG |
 | 8.7 admission backstop | shipped (`attempt_admit`, 60 attempts / 10 s per pid); `tests/test_wire87_storm.py` |
-| 8.8 daemon logging | shipped for start and release; socket activation lands with M6 |
-| 8.8 CLI exit codes | shipped — 1 usage, 2 unreachable, 3 refused, 4 reserved for dropped |
-| 8.8 library callback | **blocked** — there is no `libuictl` yet (M-lib 2) |
+| 8.8 daemon logging | shipped — start, release, **and socket activation** (M6); `tests/test_m6_activation.py` AB |
+| 8.8 CLI exit codes | shipped — 1 usage, 2 unreachable, 3 refused, 4 dropped |
+| 8.8 library callback | shipped — `uictl_on_state()`; `tests/test_mlib_lib.py` LH |
 
-Two entries are not "shipped" and neither is a gap in §8:
+**Every rule in §8 is now implemented.** The two entries that were
+blocked when this section was written have since landed, and both landed
+as the rule described rather than as a retrofit — which is what writing
+§8 before M6 and before `libuictl` was for.
 
-- **Socket activation logging** has nothing to log until M6 introduces
-  `uictld.socket`. The start line it would extend already exists.
-- **The library callback** cannot be written before `libuictl` exists
-  (M-lib 2). The rule stays normative so that the library is built to it
-  rather than having it retrofitted, which is the same reason §8 was
-  written before M6 rather than during it.
+One consequence of socket activation is worth stating here rather than
+leaving to be discovered: under activation the socket file belongs to
+the `.socket` unit and **the daemon does not remove it on shutdown**. A
+daemon that unlinked it would leave the unit listening on an inode
+nothing can reach, so every later `connect()` would fail with
+`ECONNREFUSED` and no restart of the *service* would fix it. A client
+seeing that should report it as an operator problem — the socket unit
+needs restarting — and not as a reason to retry forever.
 
 ---
 
