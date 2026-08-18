@@ -48,6 +48,16 @@ libuictl.so: $(LIB_SRCS) $(LIB_HDRS)
 	$(CC) $(filter-out -fPIE,$(CFLAGS)) -fPIC -shared $(LIB_SRCS) -o $@ \
 		$(filter-out -pie,$(LDFLAGS))
 
+# proto.json (M-lib task 3) -- the machine-readable schema. Generated,
+# committed, and checked: layout comes from src/proto.h, result classes
+# and hints come from libuictl by calling it, so the three consumers
+# (client opcode tables, the spec's op list, and auto-c v2.x's LLM tool
+# definitions) all descend from one source instead of three copies.
+proto.json: tests/gen_proto_json.c $(LIB_HDRS) libuictl.a
+	@$(CC) $(CFLAGS) $< libuictl.a -o gen-proto-json $(LDFLAGS) \
+		&& ./gen-proto-json > $@ && rm -f gen-proto-json
+	@echo "wrote $@"
+
 # WIRE.md §9's conformance vectors are generated from src/proto.h rather
 # than typed, so a field that moves in the header moves in the document.
 # Not part of `all`: it is a documentation tool, not a shipped binary,
@@ -59,4 +69,4 @@ gen-vectors: tests/gen_vectors.c src/proto.h
 clean:
 	rm -f uictl uictld uictl-confirm gen-vectors \
 	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke \
-	 
+	  gen-proto-json
