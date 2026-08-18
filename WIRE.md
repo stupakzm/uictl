@@ -19,16 +19,726 @@ decisions but is checked by the compiler.
 
 | § | Section | Status |
 |---|---|---|
-| 1 | Transport | *not yet written* |
-| 2 | Frame format | *not yet written* |
-| 3 | Handshake | *not yet written* |
-| 4 | Result codes and response classes | *not yet written* |
+| 1 | **Transport** | **normative** |
+| 2 | **Frame format** | **normative** |
+| 3 | **Handshake** | **normative** |
+| 4 | **Result codes and response classes** | **normative** |
 | 5A | **Opcodes — the pointer** | **normative** |
 | 5B | **Opcodes — the keyboard, and `BATCH`** | **normative** |
 | 6 | **Held state** | **normative** |
 | 7 | Confirmation | *not yet written* |
 | 8 | **Connection lifecycle and restart** | **normative** |
 | 9 | Conformance vectors | *not yet written* |
+
+---
+
+# 1. Transport
+
+## 1.1 The socket
+
+One `AF_UNIX`, `SOCK_STREAM` socket at **`$XDG_RUNTIME_DIR/uictld.sock`**.
+
+If `XDG_RUNTIME_DIR` is unset the daemon MUST refuse to start. It does
+not fall back to `/tmp`: a world-writable directory means another user
+can pre-create the path, win the race, and own the name every client
+connects to.
+
+`SOCK_STREAM`, never `SOCK_DGRAM`. Datagrams make request/response
+impossible to match, make `SO_PEERCRED` unreliable, and make a
+variable-length payload awkward — and on a local `AF_UNIX` socket a
+stream costs nothing extra.
+
+**The socket file's mode is `0700`** (`srwx------`), and it gets that
+mode because the daemon calls `umask(0077)` **before** `bind()`. The
+kernel creates the node with `0777 & ~umask`; there is no window in
+which it exists at any looser mode. `fchmod()` after `bind()` would
+leave exactly such a window, and a process that wins it can `connect()`
+and keep that connection after the mode tightens — the check is at
+`connect()` time, not per-write.
+
+> The mode is `0700`, not `0600`. Earlier prose in `plan.md` said
+> `0600`, describing an intent rather than the syscall: `umask(0077)`
+> cannot clear the owner-execute bit, and `bind()` does not ask for one.
+> The execute bit on a socket node means nothing to anything. What
+> matters is that all six group and world bits are clear.
+
+The path is `unlink()`ed before `bind()`, so a stale node from a crashed
+daemon does not produce `EADDRINUSE`. That unlink is safe only because
+§1.4 has already established that no other daemon is live.
+
+Both the listening socket and every accepted connection are created with
+`SOCK_CLOEXEC` (`socket()` and `accept4()` respectively). The daemon
+never `exec`s anything today — `plan.md` forbids it — but an fd that
+leaks across a future `exec` is an input device handed to a process
+nobody audited.
+
+The listen backlog is 16.
+
+## 1.2 Who may connect
+
+**`SO_PEERCRED` is the only identity in this protocol that cannot be
+forged.** Immediately after `accept4()`, before the connection is
+entered in any table, the daemon reads `struct ucred` and MUST refuse
+the peer if `cred.uid != getuid()`.
+
+The `0700` mode already enforces this in practice. The explicit check is
+what survives a configuration mistake the mode cannot cover — a
+misconfigured mount, a sandbox that forwards an already-connected fd, a
+future `--allow-uid` extension — and it costs one `getsockopt`.
+
+`cred.pid` is the key for every per-peer limit in this document: the
+admission storm counter (§1.3), the per-pid connection cap (§1.3), and
+the rate-limit bucket (§5A.0). A client cannot choose it. This is the
+whole reason `source_tag` is advisory (§2.5): the fields a client writes
+itself are never policy inputs.
+
+A refusal at this stage happens before the peer is a connection, so
+there is no request to answer. The daemon still writes one frame before
+closing, best-effort and without blocking:
+
+| field | value |
+|---|---|
+| `version` | the daemon's `UICTL_PROTO_VERSION` |
+| `opcode` | `0` (`OP_INVALID`) |
+| `source_tag` | `0` |
+| `seq` | `0` |
+| `payload_len` | `2` |
+| payload | the `u16` result code |
+
+A client MUST be prepared to read this frame at any point after
+`connect()` succeeds, including before it has sent anything.
+`connect()` succeeding means the kernel queued the connection, not that
+the daemon admitted it. A client that treats "connected" as "admitted"
+reports a refusal as a mysterious EOF.
+
+## 1.3 Admission: three checks, in this order
+
+Every accepted fd passes three checks before it becomes a connection.
+All three refuse with **`ERR_BUSY`**, which is retryable — none of them
+says anything is wrong with the client.
+
+1. **Connection-attempt storm** — at most 60 attempts per peer pid in a
+   sliding 10 s window (§8.7). Runs first, and the order is load-bearing:
+   it has to count attempts the other two would refuse anyway, or a
+   client hammering a full table is never recorded and can retry at full
+   speed forever. It is also the cheapest of the three.
+2. **Per-pid connection cap** — `MAX_CONNS_PER_PID = 4`. The reaper
+   cannot substitute for this: an idle connection with no frame in
+   progress is well-behaved by this daemon's own rules, so 32 idle
+   connections from one pid are 32 innocent connections, and this is the
+   only thing that stops them from being all of them.
+3. **Global connection table** — `MAX_CONNS = 32`.
+
+The daemon `accept()`s and then closes a connection it will not serve,
+rather than leaving it queued: an unaccepted connection keeps the
+listening socket readable forever and the daemon spins.
+
+`ERR_BUSY` is deliberately not `ERR_DENIED_BY_POLICY`. "No room right
+now" clears in milliseconds; "your uid is wrong" never clears. A client
+that cannot tell them apart either hammers a daemon that told it to go
+away, or gives up on a transient condition.
+
+## 1.4 One daemon per user
+
+Singleton enforcement is **`flock(LOCK_EX|LOCK_NB)`** on
+`~/.local/state/uictl/uictld.lock` (mode `0600`), taken before the
+socket is bound.
+
+Not a connect-probe. Two daemons starting in the same instant both get
+`ECONNREFUSED` from a probe, both conclude they are alone, and both race
+to `unlink` and `bind` — the loser's clients connect to a socket node
+its owner has already replaced. `flock` has no such window, and the lock
+is released by the kernel however the process dies, including `SIGKILL`.
+
+`~/.local/state/uictl/` MUST be mode `0700` and owned by the invoking
+uid; the daemon checks `st_uid` and `st_mode & 0077` on the directory
+and on `audit.log`, and refuses to start if either is loose. The
+directory holds the lock and the audit log, and an audit log another
+user can write is not an audit log.
+
+## 1.5 Byte order
+
+**Little-endian, always.** Every multi-byte field in this document is
+little-endian, on every architecture. There is a `_Static_assert` in
+`proto.h` that fails the build on a big-endian target rather than
+shipping a daemon that silently disagrees with its clients.
+
+Do **not** use `htons`/`htonl` to encode this protocol. Those are
+network byte order — big-endian — and on the little-endian machines this
+runs on today they would byte-swap every field into garbage. The wire is
+the native layout of the structs, `memcpy`'d.
+
+This is a per-user local socket, not a network protocol; a portable
+encoder would be work spent on a case that cannot occur, and the assert
+is what stops that assumption from becoming silent.
+
+## 1.6 The daemon never blocks on a client
+
+Every fd is non-blocking and driven by `epoll`. Three consequences a
+client can observe:
+
+- **Fairness cap.** One connection may have at most
+  `CONN_FRAMES_PER_TURN = 32` frames dispatched for it per `epoll_wait`
+  turn. This is not a rate limit — it does not slow anyone down over
+  time — it bounds how long one connection can own the loop before the
+  others are looked at.
+- **Partial frames are reaped.** A connection that has delivered part of
+  a frame and gone quiet for `CONN_PARTIAL_TIMEOUT_SEC = 5` is closed.
+  The reaper scans every `REAPER_TICK_SEC = 1`, so the effective deadline
+  is 5–6 s, not exactly 5. A client MUST NOT send a header and then wait
+  on something else before sending the payload.
+- **Undelivered responses are reaped.** A connection whose reply has been
+  staged but not drained for the same 5 s is also closed — a peer that
+  stops *reading* occupies a slot exactly as a peer that stops *sending*
+  does. No error frame is attempted on this path: the peer is by
+  definition not reading, so the write could block the daemon, which is
+  the failure this whole design removes.
+
+A reaped connection is closed, and closing releases everything it held
+(§6.4.1, §8.3).
+
+`SIGPIPE` is set to `SIG_IGN` at startup. A client that vanishes
+mid-reply produces `EPIPE` on a `write()` the daemon handles, not a
+signal that kills it.
+
+---
+
+# 2. Frame format
+
+## 2.1 The header
+
+Every frame — request, response, and the one unsolicited daemon frame —
+begins with the same 16-byte header.
+
+```c
+struct uictl_frame_header {
+    uint16_t version;
+    uint16_t opcode;
+    uint32_t source_tag;
+    uint32_t seq;
+    uint32_t payload_len;
+};
+```
+
+| offset | size | field | |
+|---|---|---|---|
+| 0 | 2 | `version` | protocol version this frame is stamped with |
+| 2 | 2 | `opcode` | see §2.2 |
+| 4 | 4 | `source_tag` | **advisory only**, see §2.5 |
+| 8 | 4 | `seq` | client's request id, echoed verbatim |
+| 12 | 4 | `payload_len` | bytes following the header |
+
+Exactly 16 bytes, asserted at compile time. There is no padding and no
+alignment hole: `u16 u16 u32 u32 u32` packs exactly.
+
+`payload_len` MUST NOT exceed **`UICTL_MAX_PAYLOAD = 4096`**. It is the
+single most attacker-controlled field in the protocol — a `u32` that the
+very next read uses as a length into a 4 KB buffer — so the daemon
+bounds it *before* it is copied anywhere, and before anything else about
+the frame is considered except the version.
+
+## 2.2 Opcodes
+
+Opcode values are on the wire. **Append only, never renumber**: a client
+built against an older header must keep meaning the same thing by the
+same number.
+
+| # | opcode | direction | § |
+|---|---|---|---|
+| 0 | `OP_INVALID` | — | never sent as a request; appears in refusals (§1.2) |
+| 1 | `OP_PING` | c→d | §2.7 |
+| 2 | `OP_MOVE_ABS` | c→d | §5A.1 |
+| 3 | `OP_HELLO` | c→d | §3 |
+| 4 | `OP_KEY_TAP` | c→d | §5B.1 |
+| 5 | `OP_KEY_SEQUENCE` | c→d | §5B.2 |
+| 6 | `OP_KEY_DOWN` | c→d | §5B.3 |
+| 7 | `OP_KEY_UP` | c→d | §5B.3 |
+| 8 | `OP_CONFIRM_SUBSCRIBE` | c→d | §7 |
+| 9 | `OP_CONFIRM_REQUEST` | **d→c** | §7 |
+| 10 | `OP_CONFIRM_DECIDE` | c→d | §7 |
+| 11 | `OP_BUTTON` | c→d | §5A.4 |
+| 12 | `OP_MOVE_REL` | c→d | §5A.2 |
+| 13 | `OP_SCROLL` | c→d | §5A.3 |
+| 14 | `OP_BATCH` | c→d | §5B.4 |
+
+A client MUST NOT infer the set of implemented opcodes from this table
+or from `daemon_version`. It discovers them from `opcode_bitmap` in the
+`HELLO` response (§3.4), where bit *N* set means opcode *N* is
+implemented by *this* daemon. Feature-sniffing by version number is how
+a protocol acquires a compatibility matrix nobody can test.
+
+An opcode the daemon does not implement is answered `ERR_OPCODE_UNKNOWN`
+(2), per-frame, and the connection survives.
+
+## 2.3 The payload
+
+`payload_len` bytes follow the header, laid out per opcode. `OP_PING`
+and `OP_CONFIRM_SUBSCRIBE` carry none: `payload_len == 0`, and the frame
+is the whole message.
+
+**Command payloads are exact-size, never "at least".** A command frame
+is only ever sent after the version has been negotiated and pinned
+(§3.3), so there is no version skew to absorb, and a wrong length means
+a broken client — the stricter check is the better one. The one
+exception is `OP_HELLO`, which is checked with `>=` for the reason §3.1
+gives.
+
+Reserved fields MUST be zero. They are wire space the daemon *reads and
+rejects* rather than ignores, so that a future field cannot collide with
+junk an old client happened to leave there.
+
+## 2.4 Responses
+
+**A response is the request's header echoed** — `version`, `opcode`,
+`source_tag`, `seq` unchanged — with `payload_len` rewritten, followed
+by:
+
+```
+uint16_t result;      /* always present, always first */
+uint8_t  data[...];   /* opcode-specific, may be empty */
+```
+
+so every response has `payload_len >= 2`, and the answer's length is
+`payload_len - 2`.
+
+Two things follow from `result` being first rather than living in a
+separate reply header. An old decoder that reads two bytes and stops
+still reads the right two bytes; and adding an answer to an opcode that
+previously only acknowledged costs a length check moving from `==` to
+`>=`, not a protocol version. Before this, `payload_len` was hardcoded
+to 2 and the daemon could acknowledge a command but never answer a
+question — which is why `OP_HELLO` had nowhere to put a capability set.
+
+**Response data grows append-only.** A client MUST accept a response
+longer than it understands and ignore the tail; it MUST NOT require an
+exact length. `uictl_resp_hello` has already used this once — it grew
+from 24 to 32 bytes in §8.6 with no version bump, and a test asserting
+`>= 24` kept passing untouched.
+
+## 2.5 `source_tag` is advisory. Permanently.
+
+The client writes `source_tag` itself, in every frame, unauthenticated.
+It MUST NOT be an input to any decision. Its only legitimate consumer is
+the audit log, where it is a hint about what the client *says* it was
+doing.
+
+Do not key a rate limit, a deny-list, an allowlist, a confirmation
+prompt, or anything else on it. That was the original design — a token
+bucket keyed on `source_tag`, CLI 50/s versus LLM 5/s — and it does not
+work for the exact case it exists for: the LLM agent sets `SRC_CLI` and
+gets 50/s. **A client choosing its own limit is not a limit.**
+
+The policy inputs are, and remain, the peer pid/uid from `SO_PEERCRED`
+(§1.2) and the class the daemon derives at `HELLO` from its own local
+registry (§3.5). Both live on the daemon's side of the socket.
+
+Defined bits: `SRC_CLI` (1), `SRC_HOTKEY` (2), `SRC_LLM` (4).
+
+## 2.6 Per-frame errors, and the two that kill the stream
+
+Most refusals are **per-frame**: the payload was fully consumed, the
+next frame boundary is known, and the connection continues. A client may
+send its next request immediately.
+
+Exactly two are **fatal to the stream**. Both are detected at the header,
+before the payload is read, and both leave the daemon unable to find the
+next frame boundary:
+
+| result | why the stream is lost |
+|---|---|
+| `ERR_VERSION` (1) at the header | the version is rejected, so `payload_len` is not trustworthy either |
+| `ERR_TOO_LARGE` (5) | those payload bytes are still queued and would be misparsed as the next header |
+
+On both the daemon writes the error frame **and then** closes, in that
+order — the close waits for the reply to actually drain. An earlier
+version wrote best-effort and closed immediately, and a client whose
+reply did not drain learned nothing but "connection reset".
+
+Note that `ERR_VERSION` is *also* returned per-frame, by the `HELLO`
+handler, when the two version ranges do not overlap (§3.3). The
+difference is where it was detected: at the header the payload has not
+been read, in the handler it has. Same code, and a client library should
+not need to tell them apart — one closes and one does not, which it
+observes either way.
+
+## 2.7 Ordering, pipelining, and the one unsolicited frame
+
+Responses on a connection arrive **in request order**. A client may
+pipeline — the daemon dispatches up to 32 frames per turn (§1.6) — and
+matches replies by position or by `seq`. A confirmable request parks the
+connection and stops it being read until the decision resolves (§7), so
+ordering holds there too.
+
+`seq` is opaque to the daemon. It is never interpreted, never
+range-checked, and never required to be unique or increasing; it is
+echoed so a client can match a reply to a request. It appears in the
+audit log.
+
+**`OP_CONFIRM_REQUEST` (9) is the single exception to request/response.**
+It is sent by the daemon, unprompted, to a client that has subscribed
+with `OP_CONFIRM_SUBSCRIBE`. A confirmer MUST therefore be written to
+read frames it did not ask for. A normal client never sees one, because
+the daemon only ever pushes on a connection that subscribed — but a
+client library that assumes "one read per write" forever is a library
+that cannot host a confirmer.
+
+`OP_PING` (1) carries a zero-length payload and answers `OK` with no
+data. It is exempt from the handshake (§3.7) and free of rate-limit
+charge, so it stays usable as a bare liveness probe by a supervisor, a
+health check, or `uictl ping`.
+
+---
+
+# 3. Handshake
+
+`OP_HELLO` is **mandatory**. Every opcode except `OP_PING` and
+`OP_HELLO` itself is refused with `ERR_HANDSHAKE_REQUIRED` (8) until it
+has succeeded on *this connection*.
+
+The handshake is where the daemon derives the client's class from its
+own registry. Without it, a client that skips `HELLO` operates at
+whatever the un-negotiated default is, forever.
+
+## 3.1 The request
+
+```c
+struct uictl_payload_hello {
+    uint16_t proto_min;
+    uint16_t proto_max;
+    char     client_name[32];   /* UICTL_CLIENT_NAME_MAX */
+};
+```
+
+Exactly 36 bytes as defined today. The daemon checks
+`payload_len >= 36`, **not `==`** — the only `>=` in the protocol.
+
+**`HELLO` is the version-invariant bootstrap frame.** Its envelope and
+the prefix of its payload are fixed for all protocol versions, and the
+daemon accepts a `HELLO` stamped with *any* version. Otherwise
+negotiation is impossible for exactly the clients that need it: a v9
+client talking to a v1 daemon cannot send a v9-stamped frame the daemon
+would admit, and cannot know to send a v1-stamped one until it has
+asked. The bootstrap frame has to be readable before agreement exists.
+
+The payload grows append-only for the same reason: an older daemon reads
+the prefix of a newer client's `HELLO`, answers with its own range, and
+the client retries inside it. Every *other* opcode is gated on the
+negotiated version.
+
+`client_name` is fixed-width and NUL-terminated rather than
+length-prefixed. At 32 bytes the waste is irrelevant, and a fixed width
+means the payload has exactly one legal size — one fewer thing for a
+decoder to get wrong.
+
+## 3.2 What the daemon checks, in order
+
+1. **Duplicate `HELLO` on this connection** → `ERR_DENIED_BY_POLICY` (4).
+   See §3.6.
+2. **Name validity** → `ERR_PAYLOAD_INVALID` (3). See §3.5.
+3. **`proto_min > proto_max`** → `ERR_PAYLOAD_INVALID`. An inverted range.
+4. **Header version outside the declared range** → `ERR_PAYLOAD_INVALID`.
+   The frame is self-describing, so it MUST NOT contradict itself: a
+   client claiming to speak 2–3 while stamping this very header version 1
+   has a bug, and guessing which half to believe is how a negotiation
+   ends with two disagreeing parties that both think they succeeded.
+5. **Range intersection** → `ERR_VERSION` (1) if empty. See §3.3.
+
+All five are per-frame, not fatal. `hello_seen` is set only on success,
+so a client MAY retry `HELLO` with a different range on the same
+connection.
+
+## 3.3 Version selection
+
+The daemon speaks `[UICTL_PROTO_MIN, UICTL_PROTO_MAX]` — currently
+`[1, 1]`. The client declares `[proto_min, proto_max]`. The selected
+version is the **highest mutually supported**:
+
+```
+lo = max(client.proto_min, daemon.MIN)
+hi = min(client.proto_max, daemon.MAX)
+selected = hi          if lo <= hi
+ERR_VERSION            otherwise
+```
+
+Highest, because both sides claim to speak everything in their range, so
+the newest common version has the most features and no downside.
+
+**The version is then pinned for the life of the connection.** Every
+subsequent frame MUST carry `version == selected` or it is refused with
+a fatal `ERR_VERSION` (§2.6). Allowing a client to hop versions
+mid-connection would mean the same opcode could carry two different
+payload layouts on one stream and the daemon would be guessing which one
+it had just parsed. Negotiation that can be revised is not negotiation.
+
+Before `HELLO` succeeds, a non-`HELLO` frame is admitted at any version
+the daemon speaks — the pin does not exist yet.
+
+### 3.3.1 When to bump the version
+
+**Bump `UICTL_PROTO_MAX` only for a change that breaks an existing
+decoder**: a field resized, reordered, or given a new meaning.
+
+Do **not** bump for additions. A new opcode is discovered through
+`opcode_bitmap`, a new device ability through `device_caps`, and a new
+trailing field through the append-only response rule (§2.4). That is the
+entire point of shipping a capability map, and it is why adding
+`OP_HELLO` itself needed no bump. Raise `UICTL_PROTO_MIN` only to drop
+support for an old version, which is a deliberate compatibility break.
+
+## 3.4 The response
+
+`result` is `OK`, followed by:
+
+```c
+struct uictl_resp_hello {          /* 32 bytes */
+    uint16_t proto_selected;       /* version pinned for this connection */
+    uint16_t device_caps;          /* CAP_* bits                         */
+    uint32_t abs_range_max;        /* ABS_X/ABS_Y max, device units      */
+    uint64_t opcode_bitmap;        /* bit N set => opcode N implemented  */
+    uint32_t daemon_version;       /* informational only                 */
+    uint32_t reserved;             /* MUST be zero                       */
+    /* appended in §8.6: */
+    uint8_t  reconnect_mode;       /* RECONNECT_*                        */
+    uint8_t  reconnect_max_tries;  /* 0 = unbounded                      */
+    uint16_t reconnect_base_ms;    /* first delay, doubling              */
+    uint32_t reserved2;            /* MUST be zero                       */
+};
+```
+
+A client MUST accept any response of at least 24 bytes — the pre-§8.6
+prefix — and ignore a tail it does not understand. A client that demands
+exactly 32 has already broken the growth rule for the next field.
+
+`device_caps` bits:
+
+| bit | | |
+|---|---|---|
+| 1 | `CAP_POINTER_ABS` | `EV_ABS` `ABS_X`/`ABS_Y` |
+| 2 | `CAP_KEYBOARD` | `EV_KEY` |
+| 4 | `CAP_POINTER_REL` | `REL_X`/`REL_Y`, wheels |
+| 8 | `CAP_BUTTONS` | `BTN_LEFT`/`RIGHT`/`MIDDLE` |
+
+**`device_caps` describes the device; `opcode_bitmap` describes the
+protocol. Capability is not permission.** The daemon registers every
+keycode on the virtual keyboard while the RPC layer still refuses most
+of them, so `CAP_KEYBOARD` can be set in a build where no key opcode is
+advertised. A client MUST gate on the opcode bit.
+
+`daemon_version` (`major<<16 | minor<<8 | patch`) is informational.
+Branching on it is the feature-sniffing §2.2 forbids.
+
+`abs_range_max` is the coordinate contract: `MOVE_ABS` coordinates are
+**device units, `0..abs_range_max`, and the client converts** — not
+pixels, not a fraction. The daemon clamps to this range. It deliberately
+does not know your screen geometry, because learning it means talking to
+the compositor, which drags a Wayland dependency into the most
+security-sensitive binary in the stack.
+
+`reserved` and `reserved2` are explicit fields, not compiler padding.
+The struct is `memcpy`'d straight onto a socket, and uninitialised tail
+padding on the wire is a stack-content leak to whatever is listening.
+Naming them means they get zeroed like everything else, and
+`tests/test_m36_hello.py` asserts `reserved == 0` as a canary. That is
+also why `reserved` was not repurposed when §8.6 needed four bytes:
+spending it would have meant deleting a security check to save four
+bytes on a message sent once per connection.
+
+## 3.5 The name is a label, not a credential
+
+`client_name` is **self-asserted and always will be.** Anything that
+must be unforgeable comes from `SO_PEERCRED` instead.
+
+Its value is that it is asserted *once, at a checkpoint*, where an
+unknown name can default to the most restrictive class — rather than
+per-frame, like `source_tag`.
+
+A valid name is 1–31 bytes of `[A-Za-z0-9._-]`, NUL-terminated, with
+every byte after the NUL also zero. This is not cosmetic:
+
+- The name's destination is the **audit log**, which is
+  newline-delimited text. A name containing `\n` lets a client write
+  forged audit lines — invented pids, invented opcodes, invented denials
+  — into the one record that exists to hold it accountable. The
+  character set kills that class outright, along with terminal escape
+  sequences aimed at whoever reads the log with `cat`.
+- Bytes after the NUL are invisible to every consumer, so allowing them
+  would make two different payloads produce identical log lines, and hand
+  a covert channel to a client whose whole purpose is to be observable.
+
+On an invalid name the daemon answers `ERR_PAYLOAD_INVALID` and
+**deliberately does not echo the name back** — it just failed the check
+that makes it safe to put in a log.
+
+The name is looked up in `~/.config/uictl/clients`, read **once at
+startup**, one entry per line:
+
+```
+<name> <class> [confirm] [confirmer] [reconnect=never|backoff[:BASE_MS[:MAX_TRIES]]]
+```
+
+It yields:
+
+| | |
+|---|---|
+| class | `untrusted` (5/s), `standard` (20/s), `interactive` (50/s) |
+| roles | `confirm` (device requests need a human, §7), `confirmer` (may subscribe) |
+| reconnect advice | returned in the response, §8.6 |
+
+**A name not in the registry — or no registry file at all — is
+`untrusted`**, which is the 5/s floor and no roles. That is what the
+v2.x LLM agent gets until someone writes it into the file deliberately.
+The registry file must be a regular file owned by the invoking uid with
+no group/world bits, or the daemon ignores it entirely and says so on
+stderr: the file decides who gets elevated, so another user being able to
+write it would be the whole game.
+
+Loading once rather than per-`HELLO` keeps file I/O out of the request
+path and means a config edit does not take effect halfway through a
+session, for some connections and not others. The daemon's policy is
+whatever it started with — which is also what makes the audit log
+meaningful.
+
+## 3.6 One `HELLO` per connection
+
+A second successful `HELLO` on the same connection is
+`ERR_DENIED_BY_POLICY` — terminal, not retryable.
+
+A second one would let a client rename itself *after* the daemon has
+attached a class to the first name, which is exactly the per-frame
+self-assertion this frame exists to replace. **The connection is the
+scope of the handshake.** A client that wants a different identity opens
+a different connection.
+
+Nothing negotiated here survives the connection. Reconnecting requires a
+fresh `HELLO`, and no client may cache a previous connection's selected
+version, class, or capability set — see §8.2 and §8.4.
+
+## 3.7 What is exempt, and why
+
+`OP_PING` is exempt from the handshake on purpose: it neither reads
+state nor touches the device, and it stays usable as a bare liveness
+probe. `OP_HELLO` is exempt for the obvious reason.
+
+The handshake check runs **before** the opcode switch, so an
+un-handshaked peer is told to handshake rather than told which opcodes
+exist. The refusal reveals nothing about the daemon's surface, and there
+is exactly one thing the client can do next. `ERR_OPCODE_UNKNOWN` is a
+post-handshake answer.
+
+`OP_PING` and `OP_HELLO` are also free of rate-limit charge. A liveness
+probe and a handshake are how a client finds out it is being limited;
+charging them would mean a throttled client cannot ask why. This is the
+same principle that makes every *release* free — §6.3.
+
+---
+
+# 4. Result codes and response classes
+
+## 4.1 The codes
+
+Values are on the wire. **Append only — never insert, never reorder.** A
+client built against an older header must keep decoding every code it
+already knows to the same meaning.
+
+| # | code | class | meaning |
+|---|---|---|---|
+| 0 | `OK` | — | success |
+| 1 | `ERR_VERSION` | terminal | no overlapping protocol version, or a frame stamped off the pinned version (§3.3) |
+| 2 | `ERR_OPCODE_UNKNOWN` | terminal | this daemon does not implement that opcode |
+| 3 | `ERR_PAYLOAD_INVALID` | terminal | wrong length, out-of-range value, or a non-zero reserved field |
+| 4 | `ERR_DENIED_BY_POLICY` | terminal | peer uid mismatch (§1.2), duplicate `HELLO` (§3.6) |
+| 5 | `ERR_TOO_LARGE` | terminal | `payload_len > 4096` |
+| 6 | `ERR_INTERNAL` | terminal | the write to `/dev/uinput` failed, or a daemon bug |
+| 7 | `ERR_BUSY` | retryable | no connection slot right now (§1.3) |
+| 8 | `ERR_HANDSHAKE_REQUIRED` | correctable | send `OP_HELLO` on this connection, then retry |
+| 9 | `ERR_KEY_DENYLISTED` | terminal | a destructive key. Static, in the daemon, not configurable |
+| 10 | `ERR_KEY_NOT_ALLOWED` | fixable | absent from `~/.config/uictl/policy` |
+| 11 | `ERR_RATE_LIMITED` | retryable after a wait | going faster than this client's class allows |
+| 12 | `ERR_KEY_ALREADY_HELD` | client bug | *you* already hold this key |
+| 13 | `ERR_KEY_HELD_BY_OTHER` | retryable after a wait | another connection holds it |
+| 14 | `ERR_KEY_NOT_HELD` | client bug | an `UP` for a key this connection does not hold |
+| 15 | `ERR_TOO_MANY_HELD` | client bug | over `MAX_HELD_PER_CONN = 16` |
+| 16 | `ERR_CONFIRM_UNAVAILABLE` | fixable | this client needs a human and no confirmer is connected |
+| 17 | `ERR_CONFIRM_DENIED` | terminal | a human saw it and said no |
+| 18 | `ERR_CONFIRM_TIMEOUT` | retryable | nobody answered in time |
+| 19 | `ERR_NOT_CONFIRMER` | terminal | `SUBSCRIBE` from a client without the `confirmer` role, or a second subscriber |
+
+## 4.2 The five classes
+
+The classes exist because **a client library needs to tell them apart to
+have a sane retry policy at all**, and the failure mode of conflating
+them is concrete in both directions: answer a rate limit with a retry
+storm and you make it worse; give up on `ERR_BUSY` and you have
+abandoned a condition that clears in milliseconds.
+
+**terminal** — retrying changes nothing. Report it and stop.
+`ERR_VERSION`, `ERR_OPCODE_UNKNOWN`, `ERR_PAYLOAD_INVALID`,
+`ERR_DENIED_BY_POLICY`, `ERR_TOO_LARGE`, `ERR_INTERNAL`,
+`ERR_KEY_DENYLISTED`, `ERR_CONFIRM_DENIED`, `ERR_NOT_CONFIRMER`.
+
+**fixable** — retrying identically fails, but a stated change to local
+configuration makes it work. The client SHOULD say what the change is.
+`ERR_KEY_NOT_ALLOWED` ("add the keycode to `~/.config/uictl/policy` and
+restart the daemon"), `ERR_CONFIRM_UNAVAILABLE` ("run `uictl-confirm`").
+
+**retryable** — the daemon is momentarily out of room, or another
+connection is mid-gesture, or you are going too fast. Back off and try
+again. `ERR_BUSY`, `ERR_KEY_HELD_BY_OTHER`, `ERR_RATE_LIMITED`,
+`ERR_CONFIRM_TIMEOUT`.
+
+**client bug** — the request contradicts state the client itself
+established. Retrying identically fails; the client has to reconcile its
+own held set first. `ERR_KEY_ALREADY_HELD`, `ERR_KEY_NOT_HELD`,
+`ERR_TOO_MANY_HELD`.
+
+**correctable** — the request was fine, the connection was not ready.
+`ERR_HANDSHAKE_REQUIRED`: send `OP_HELLO` on this same connection and
+the retry succeeds.
+
+## 4.3 Why some distinctions are two codes and not one
+
+Each of these pairs was deliberately not collapsed, and in each case the
+reason is that the *right client response differs*:
+
+- **`ERR_KEY_DENYLISTED` vs `ERR_KEY_NOT_ALLOWED`.** One is a
+  destructive key, static in the daemon, not overridable by
+  configuration; the other is one line of config away from working. A
+  client that cannot distinguish them can only print "denied", which
+  leaves the user to guess between "add a line to a file" and "this will
+  never work, do something else". Telling a user to edit their policy
+  file for a deny-listed key sends them to do something that cannot
+  succeed.
+- **`ERR_BUSY` vs `ERR_RATE_LIMITED`.** `ERR_BUSY` says the daemon has
+  no room and nothing about the client was wrong. `ERR_RATE_LIMITED`
+  says the client is going faster than its class allows and the fix is
+  to *pace itself*, not to retry harder.
+- **`ERR_BUSY` vs `ERR_DENIED_BY_POLICY`.** Before `ERR_BUSY` existed,
+  "table full" and "wrong uid" were the same code, so a client had to
+  either hammer a daemon that had told it to go away or give up on a
+  condition that clears in milliseconds.
+- **`ERR_KEY_ALREADY_HELD` vs `ERR_KEY_HELD_BY_OTHER` vs
+  `ERR_KEY_NOT_HELD`.** You lost track of your own state; someone else is
+  mid-gesture, back off; the key is up either way. Three different next
+  moves — see §6.2.
+- **`ERR_CONFIRM_DENIED` vs `ERR_DENIED_BY_POLICY`.** "The user said no"
+  and "the rules say no" are different events: one is a decision that
+  could go the other way next time, the other is a property of the
+  configuration.
+
+## 4.4 What is deliberately absent
+
+**There is no result code for "a release was refused."**
+
+A client that holds a key MUST always be able to release it, so the
+release path is not policy-gated, not rate-limited, and not
+confirmation-gated. Any refusal of a release is a stuck key, which is
+the failure this protocol works hardest to make impossible. §6.3 is the
+normative statement; this is the note that the gap in the enum is
+intentional and must stay.
+
+`ERR_KEY_NOT_HELD` is not a counterexample: it reports that there was
+nothing to release, and the key is up either way — which is what the
+client wanted.
 
 ---
 
