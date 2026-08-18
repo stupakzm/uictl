@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed fuzz/corpus from WIRE.md §9's conformance vectors.
+"""Seed fuzz/corpus from vectors.json — WIRE.md §9's vectors, machine-readable.
 
 Real frames, not random bytes. A fuzzer starting from nothing spends its
 early campaign discovering that a 16-byte header exists and that
@@ -9,27 +9,28 @@ handlers on the first run, which is where the interesting state lives.
 The negative vectors (N*) are seeded too, and deliberately: they are the
 inputs the daemon must reject, so they sit exactly on the boundary the
 fuzzer wants to explore from.
+
+This used to scrape the hex dumps out of WIRE.md with a regex. It reads
+vectors.json instead, which exists because this file needed it: a
+markdown scraper in the fuzz harness was the first evidence that shipping
+the vectors as prose made every consumer write a parser. Run
+`make vectors.json` if it is missing.
 """
+import json
 import os
-import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 CORPUS = os.path.join(HERE, "corpus")
 
-doc = open(os.path.join(REPO, "WIRE.md")).read()
-body = doc.split("<!-- BEGIN GENERATED VECTORS -->", 1)[1] \
-          .split("<!-- END GENERATED VECTORS -->", 1)[0]
+with open(os.path.join(REPO, "vectors.json")) as f:
+    vectors = json.load(f)["vectors"]
 
 os.makedirs(CORPUS, exist_ok=True)
 n = 0
-for m in re.finditer(r"^#### ([RSPN]\d+) — .*?\n\n(.*?)```\n(.*?)```",
-                     body, re.S | re.M):
-    raw = bytearray()
-    for line in m.group(3).splitlines():
-        for byte in line.split()[1:]:
-            raw += bytes([int(byte, 16)])
-    open(os.path.join(CORPUS, m.group(1)), "wb").write(bytes(raw))
+for v in vectors:
+    with open(os.path.join(CORPUS, v["id"]), "wb") as f:
+        f.write(bytes.fromhex(v["bytes"]))
     n += 1
 
 # One hand-made seed the vectors cannot provide: a HELLO followed by a

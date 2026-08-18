@@ -68,6 +68,7 @@ python3 tests/test_wire9_vectors.py
 %{_userunitdir}/uictld.service
 %dir %{_datadir}/uictl
 %{_datadir}/uictl/proto.json
+%{_datadir}/uictl/vectors.json
 %{_datadir}/uictl/WIRE.md
 %config(noreplace) %{_sysconfdir}/apparmor.d/usr.libexec.uictld
 

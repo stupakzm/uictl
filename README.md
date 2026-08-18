@@ -74,7 +74,11 @@ compiles against. A client in any language can be written from it
 without linking anything.
 
 `proto.json` is the same contract, machine-readable, for code
-generators and for LLM tool definitions.
+generators and for LLM tool definitions. `vectors.json` is §9's
+conformance vectors in the same spirit — byte strings, expected result
+codes, and the byte ranges that vary by environment — so an
+implementation in another language self-tests without parsing the
+document or copying frames into its own source.
 
 `libuictl` is a convenience for C clients, not the contract. It never
 prints, never replays a request whose outcome is unknown, and makes a

@@ -2097,6 +2097,18 @@ them without a running daemon — which is the point: the first external
 consumer is written in Rust, will not link `libuictl`, and needs
 something better than prose to test against.
 
+**Machine-readable form: `vectors.json`**, installed to
+`$datadir/uictl/vectors.json`. Same vectors, emitted by the same
+generator (`gen_vectors --json`, `make vectors.json`), carrying for each
+one its id, kind, byte string, the vector a response answers, the result
+code a rejected frame MUST produce, and the byte ranges marked
+**[varies]** below as explicit `{offset, len}` pairs. Use it for the
+assertions and read this section for the reasons — a consumer that has to
+regex a markdown table is a consumer that will ship a second copy of the
+frames, which is what §9 exists to prevent.
+`tests/test_wire9_vectors.py` fails if the JSON and this document ever
+carry different bytes.
+
 **These vectors are generated, not typed.** `tests/gen_vectors.c` emits
 this section from `src/proto.h`, so every offset, size and enum value
 comes from the same header the daemon compiles against.

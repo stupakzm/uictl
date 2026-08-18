@@ -80,7 +80,7 @@ apparmordir ?= $(sysconfdir)/apparmor.d
 
 INSTALL ?= install
 
-install: all lib proto.json
+install: all lib proto.json vectors.json
 	$(INSTALL) -d -m 0755 $(DESTDIR)$(libexecdir)
 	$(INSTALL) -m 0755 uictld $(DESTDIR)$(libexecdir)/uictld
 	$(INSTALL) -d -m 0755 $(DESTDIR)$(bindir)
@@ -98,6 +98,7 @@ install: all lib proto.json
 	chmod 0644 $(DESTDIR)$(libdir)/pkgconfig/uictl.pc
 	$(INSTALL) -d -m 0755 $(DESTDIR)$(datadir)/uictl
 	$(INSTALL) -m 0644 proto.json $(DESTDIR)$(datadir)/uictl/proto.json
+	$(INSTALL) -m 0644 vectors.json $(DESTDIR)$(datadir)/uictl/vectors.json
 	$(INSTALL) -m 0644 WIRE.md $(DESTDIR)$(datadir)/uictl/WIRE.md
 	$(INSTALL) -d -m 0755 $(DESTDIR)$(systemduserdir)
 	$(INSTALL) -m 0644 systemd/uictld.socket \
@@ -117,6 +118,7 @@ uninstall:
 	rm -f $(DESTDIR)$(libdir)/pkgconfig/uictl.pc
 	rm -f $(DESTDIR)$(includedir)/uictl/uictl.h
 	rm -f $(DESTDIR)$(datadir)/uictl/proto.json
+	rm -f $(DESTDIR)$(datadir)/uictl/vectors.json
 	rm -f $(DESTDIR)$(datadir)/uictl/WIRE.md
 	rm -f $(DESTDIR)$(systemduserdir)/uictld.socket
 	rm -f $(DESTDIR)$(systemduserdir)/uictld.service
@@ -161,6 +163,22 @@ uninstall-user:
 proto.json: tests/gen_proto_json.c $(LIB_HDRS) libuictl.a
 	@$(CC) $(CFLAGS) $< libuictl.a -o gen-proto-json $(LDFLAGS) \
 		&& ./gen-proto-json > $@ && rm -f gen-proto-json
+	@echo "wrote $@"
+
+# vectors.json (M-lib task 5) -- WIRE.md section 9's vectors, machine-
+# readable. Task 5's words were "ship a conformance vector file so a
+# from-scratch implementation can self-test", and hex dumps inside
+# markdown tables are not that: the first two consumers both had to
+# scrape the document, and a Rust implementation would have had to copy
+# the frames into its own source -- the second copy this project refuses
+# everywhere else.
+#
+# Same generator as section 9, in a second output mode, so there is still
+# ONE definition of every vector. tests/test_wire9_vectors.py checks that
+# this file is current AND that its bytes equal the document's hex.
+vectors.json: tests/gen_vectors.c src/proto.h
+	@$(CC) $(CFLAGS) $< -o gen-vectors-json $(LDFLAGS) \
+		&& ./gen-vectors-json --json > $@ && rm -f gen-vectors-json
 	@echo "wrote $@"
 
 # ---- fuzzing (M8, closes analysis §B3) -------------------------------
@@ -213,4 +231,4 @@ gen-vectors: tests/gen_vectors.c src/proto.h
 clean:
 	rm -f uictl uictld uictl-confirm gen-vectors \
 	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke \
-	  gen-proto-json fuzz-frame fuzz-frame-repro
+	  gen-proto-json gen-vectors-json fuzz-frame fuzz-frame-repro
