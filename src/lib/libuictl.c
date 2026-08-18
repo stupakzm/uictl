@@ -799,7 +799,8 @@ const char *uictl_result_hint(uint16_t result) {
   case ERR_TOO_MANY_HELD:
     return "reconcile your own held set before retrying";
   case ERR_DENIED_BY_POLICY:
-    return "the daemon serves only its own uid";
+    return "check uictld's stderr: wrong uid, a client name bound to a "
+           "different binary, or a duplicate handshake";
   default:
     return "";
   }

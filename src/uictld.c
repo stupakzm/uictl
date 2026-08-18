@@ -231,6 +231,77 @@ static int class_from_word(const char *word, enum client_class *out) {
 #define MAX_REGISTERED_CLIENTS 16
 #define REGISTRY_MAX_BYTES 4096
 
+/* ---- per-binary peer identity (M9) ----------------------------------
+   What the kernel will tell us about the program on the other end of the
+   socket, as opposed to what that program says about itself.
+
+   THE HONEST FRAMING FIRST. A client name is self-asserted at HELLO
+   (WIRE.md §3.5): a hostile process of the same uid can claim any name
+   in the registry, which is why §7.0 says confirmation is a speed bump
+   in front of a cooperative client rather than a boundary against a
+   hostile one. /proc/<pid>/exe is the first identity in this project
+   that a client cannot simply declare. It is not a capability either --
+   see the race below -- but binding a registry entry to a path means
+   claiming a privileged name now requires running the actual binary,
+   which is a different and much higher bar than typing its name into a
+   HELLO.
+
+   THE RACE, stated rather than hidden. The link is read once, just after
+   accept4(), and a process can exec() something else immediately
+   afterwards while keeping the connected fd. So the reading describes
+   the program that was running at accept time, not necessarily the one
+   running now. Two things bound the damage: to become a trusted binary a
+   process must exec it, which destroys its own image, and the fd it
+   keeps across a later exec was still opened by the trusted program. It
+   is a strictly better signal than a name, and it is still evidence
+   rather than proof. Anything that must be unforgeable stays with
+   SO_PEERCRED, which the kernel fills in and nobody can influence.
+
+   512 bytes, and a longer path FAILS CLOSED rather than being stored
+   truncated. A truncated path that then compares equal to a registry
+   prefix would be exactly the kind of silent weakening this project
+   keeps refusing -- and no real installation path is anywhere near
+   this. */
+#define UICTL_EXE_MAX 512
+
+/* Reads /proc/<pid>/exe. Returns 0 and fills `out`, or -1 for every
+   reason the answer cannot be trusted: the process is gone, /proc is
+   mounted with hidepid, the path does not fit, or the executable has
+   been replaced or deleted since it started.
+
+   "(deleted)" is refused rather than stripped. The kernel appends it
+   when the inode the link named is gone -- a package upgrade, or a
+   binary that unlinked itself -- and at that point the path is a
+   historical note, not something to compare a policy against. A daemon
+   that stripped the suffix and matched anyway would happily bind a
+   registry entry to a file that no longer exists. */
+static int peer_exe(pid_t pid, char *out, size_t outlen) {
+  char link[64];
+  int n = snprintf(link, sizeof(link), "/proc/%d/exe", (int)pid);
+  if (n < 0 || (size_t)n >= sizeof(link))
+    return -1;
+
+  ssize_t r = readlink(link, out, outlen - 1);
+  if (r < 0)
+    return -1;
+  if ((size_t)r >= outlen - 1) /* truncated: fail closed */
+    return -1;
+  out[r] = '\0';
+
+  static const char deleted[] = " (deleted)";
+  size_t len = (size_t)r;
+  if (len >= sizeof(deleted) - 1 &&
+      strcmp(out + len - (sizeof(deleted) - 1), deleted) == 0)
+    return -1;
+
+  /* An exe path that is not absolute cannot have come from a normal
+     exec, and comparing it against a registry entry would be comparing
+     against something unanchored. */
+  if (out[0] != '/')
+    return -1;
+  return 0;
+}
+
 /* Roles are orthogonal to class, and deliberately so (M5). Class answers
    "how fast may this client go"; a role answers "what is this client
    *for*". The LLM agent is untrusted AND needs a human in the loop; a
@@ -263,6 +334,14 @@ struct client_reg {
   uint8_t reconnect_mode;
   uint8_t reconnect_max_tries;
   uint16_t reconnect_base_ms;
+
+  /* M9. When set, this name may only be claimed by a peer whose
+     /proc/<pid>/exe is exactly this path. Empty means the name is
+     claimable by anything, which is the pre-M9 behaviour and stays the
+     default -- binding is opt-in per entry, because it is the operator
+     who knows where their binaries live. */
+  char exe[UICTL_EXE_MAX];
+  int has_exe;
 };
 
 static struct client_reg registry[MAX_REGISTERED_CLIENTS];
@@ -391,7 +470,25 @@ static void load_client_registry(void) {
         entry.roles |= ROLE_CONFIRM;
       else if (strcmp(r, "confirmer") == 0)
         entry.roles |= ROLE_CONFIRMER;
-      else if (strncmp(r, "reconnect=", 10) == 0) {
+      else if (strncmp(r, "exe=", 4) == 0) {
+        /* exe=/absolute/path (M9). Binds this name to one binary.
+           Absolute only: a relative path would be compared against
+           whatever /proc reports, which is always absolute, so it could
+           never match -- and a rule that can never match is a rule an
+           operator believes is protecting them. */
+        const char *v = r + 4;
+        size_t vlen = strlen(v);
+        if (v[0] != '/' || vlen == 0 || vlen >= sizeof(entry.exe)) {
+          fprintf(stderr,
+                  "uictld: client registry line %d: exe= needs an absolute "
+                  "path under %zu characters\n",
+                  line_no, sizeof(entry.exe));
+          role_ok = 0;
+          break;
+        }
+        memcpy(entry.exe, v, vlen + 1);
+        entry.has_exe = 1;
+      } else if (strncmp(r, "reconnect=", 10) == 0) {
         /* reconnect=never
            reconnect=backoff
            reconnect=backoff:BASE_MS
@@ -458,7 +555,7 @@ static void load_client_registry(void) {
       } else {
         fprintf(stderr,
                 "uictld: client registry line %d: unknown role '%s' "
-                "(expected confirm|confirmer|reconnect=…) — dropping the "
+                "(expected confirm|confirmer|exe=|reconnect=…) — dropping the "
                 "whole entry\n",
                 line_no, r);
         role_ok = 0;
@@ -484,6 +581,13 @@ static void load_client_registry(void) {
             entry.name, class_name(entry.cl),
             (entry.roles & ROLE_CONFIRM) ? " +confirm" : "",
             (entry.roles & ROLE_CONFIRMER) ? " +confirmer" : "", rc);
+    /* On its own line because it is a path and paths are long. Printed
+       at startup rather than only on a denial: an operator who has bound
+       a name wants to see, once, that the daemon read the path they
+       meant -- not to discover a typo the first time the client is
+       refused. */
+    if (entry.has_exe)
+      fprintf(stderr, "uictld:   bound to %s\n", entry.exe);
   }
 }
 
@@ -860,6 +964,12 @@ struct conn {
   int fd;            /* < 0 => slot free. the ONLY free marker.        */
   struct ucred cred; /* captured once at accept; never re-read.        */
 
+  /* M9: what /proc said the peer was running, read once at accept for
+     the same reason cred is -- re-reading later would sample a different
+     moment and give the answer a false freshness it cannot have. Empty
+     when unknown, and unknown FAILS every binding check. */
+  char exe[UICTL_EXE_MAX];
+
   /* --- read side --- invariant: have <= want <= sizeof(buf) --------- */
   enum conn_phase phase;
   size_t want;                   /* bytes this phase still needs total */
@@ -1144,6 +1254,10 @@ static struct conn *conn_alloc(int fd, const struct ucred *cred) {
     /* Not just [0] = '\0': the whole array is compared and printed, and
        a reused slot must not carry a previous peer's name in its tail. */
     memset(c->client_name, 0, sizeof(c->client_name));
+    /* Same reasoning, and it matters more here: a stale exe path in a
+       reused slot would satisfy a registry binding for a peer that
+       never had it. The caller fills this immediately (M9). */
+    memset(c->exe, 0, sizeof(c->exe));
     /* A reused slot inheriting the previous peer's holds would make the
        new client unable to press a key it never pressed (task 3 would
        see it as already held) and would leave task 2 synthesizing a
@@ -2510,6 +2624,56 @@ static void conn_handle_frame(int epfd, struct conn *c, const struct uinput_devs
       break;
     }
 
+    /* M9: a registry entry may bind its name to one binary. Checked
+       BEFORE anything is assigned to the connection, so a peer that
+       fails the binding gets no class, no roles and no negotiated
+       version out of the attempt -- a partial application here would be
+       the "identity that starts permissive and gets narrowed later"
+       that conn_alloc's comment warns about, arriving through a
+       different door.
+
+       Fails closed on an unknown exe. If /proc could not be read, or
+       the binary was replaced since it started, the daemon cannot show
+       that this peer is the bound program, and "cannot show" is the
+       only answer a check like this may give. */
+    {
+      const struct client_reg *bind = reg_for_name(hello.client_name);
+      if (bind && bind->has_exe) {
+        if (c->exe[0] == '\0') {
+          result = ERR_DENIED_BY_POLICY;
+          snprintf(args, sizeof(args),
+                   "name=%s is bound to a binary and this peer's exe is "
+                   "unknown",
+                   hello.client_name);
+          break;
+        }
+        if (strcmp(c->exe, bind->exe) != 0) {
+          /* NEITHER path goes in the audit line, for two different
+             reasons. The peer's is attacker-chosen text heading for a
+             newline-delimited log -- the same reasoning that stops a
+             rejected client name being echoed (WIRE.md §3.5). The
+             registry's is safe but long, and a path plus this record's
+             fixed prefix does not fit in an audit line, so including it
+             would mean truncating it mid-path: the one part of the
+             record somebody is reading it for.
+
+             The line says which name failed and why. The expected path
+             goes to stderr, which is not newline-delimited machine
+             output and is where an operator diagnosing their own
+             registry is already looking. */
+          result = ERR_DENIED_BY_POLICY;
+          snprintf(args, sizeof(args),
+                   "name=%s is bound to a different binary",
+                   hello.client_name);
+          fprintf(stderr,
+                  "uictld: refused HELLO name=%s from pid %d: the registry "
+                  "binds that name to\n         %s\n",
+                  hello.client_name, (int)c->cred.pid, bind->exe);
+          break;
+        }
+      }
+    }
+
     c->proto_min = hello.proto_min;
     c->proto_max = hello.proto_max;
     c->proto_selected = hi;
@@ -3790,6 +3954,13 @@ static void conn_dump_table(void) {
             c->out_sent, c->out_len, (long long)(now - c->accepted_at),
             (unsigned long long)c->frames_served, c->held_count,
             c->held_since ? (long long)(now - c->held_since) : 0LL);
+    /* M9, and on its own line because it is a path. This is the answer
+       to "which program is that, really" -- the name on the line above
+       is what the client said about itself, and this is what the kernel
+       said about it at accept. When they disagree, this is the one to
+       believe. "?" means /proc could not be read, or the binary has been
+       replaced since it started. */
+    fprintf(stderr, "          exe=%s\n", c->exe[0] ? c->exe : "?");
   }
   fflush(stderr);
 }
@@ -4501,6 +4672,13 @@ int main(void) {
             deny_and_close(cfd, ERR_BUSY);
             continue;
           }
+
+          /* M9: read the peer's binary now, while the process that
+             connected is still the process that connected. Failure is
+             not an error -- an unknown exe simply cannot satisfy a
+             registry binding -- so nothing is refused here. */
+          if (peer_exe(cred.pid, c->exe, sizeof(c->exe)) < 0)
+            c->exe[0] = '\0';
 
           struct epoll_event cev = {.events = EPOLLIN,
                                     .data.u64 = conn_evkey(c)};

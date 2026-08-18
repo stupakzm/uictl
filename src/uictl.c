@@ -124,12 +124,22 @@ static void explain(uint16_t result, long detail) {
             detail, detail);
     break;
   case UICTL_RES_DENIED_BY_POLICY:
+    /* Three different situations share this code, and the advice has to
+       cover all three or it sends someone to check the one thing that is
+       already fine. The daemon's stderr says which; this says where to
+       look. */
     fprintf(stderr,
-            "  why:  the daemon refused this peer\n"
-            "  fix:  uictld only serves connections from its own uid. check "
-            "you are\n"
-            "        running as the same user that started it (`id`, "
-            "`pgrep -a uictld`).\n");
+            "  why:  the daemon refused this peer. one of:\n"
+            "        - you are not the uid that started uictld\n"
+            "        - the client name is bound to a specific binary in\n"
+            "          ~/.config/uictl/clients (`exe=`) and this program "
+            "is not it\n"
+            "        - a second HELLO was sent on one connection (client "
+            "bug)\n"
+            "  fix:  uictld's stderr names which. check `id` against "
+            "`pgrep -a uictld`,\n"
+            "        and check any `exe=` on this name against `readlink "
+            "/proc/self/exe`.\n");
     break;
   case UICTL_RES_HANDSHAKE_REQUIRED:
     fprintf(stderr,

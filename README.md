@@ -33,6 +33,14 @@ Hotkey and evdev logic belongs in clients. The AppArmor profile in
 It has **no network surface**, never `fork`s, never `exec`s, and never
 runs as root or with setuid or setcap.
 
+Client names in `~/.config/uictl/clients` are self-asserted, so by
+default any process of your uid can claim one. Adding `exe=/abs/path` to
+an entry binds that name to a binary, checked against
+`/proc/<pid>/exe` at connect time. That raises the cost of claiming a
+privileged name from "type it" to "run that program", which is worth
+having — but it is checked once, at accept, so treat it as strong
+evidence rather than as a capability.
+
 ## Building and running
 
 ```

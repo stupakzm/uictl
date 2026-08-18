@@ -136,12 +136,17 @@ profile uictld /usr/libexec/uictld {
   audit deny @{HOME}/.ssh/** rwklx,
   audit deny @{HOME}/.gnupg/** rwklx,
 
-  # ---- /proc: its own process and nothing else -----------------------
-  # M9 will want /proc/<peer-pid>/exe for per-binary identity. When it
-  # lands, the rule it needs is a read of one symlink and it should be
-  # added here explicitly rather than by widening the deny below.
+  # ---- /proc: its own process, and one symlink of its peers ----------
   owner @{PROC}/@{pid}/** r,
+
+  # M9. The daemon reads /proc/<peer-pid>/exe once per accepted
+  # connection to learn which binary is on the other end. One symlink,
+  # read-only, and nothing else about another process -- narrow on
+  # purpose, because "let it read /proc" is how a confined daemon
+  # acquires the ability to enumerate everything a user is running.
+  @{PROC}/[0-9]*/exe r,
   audit deny @{PROC}/[0-9]*/mem rwklx,
+  audit deny @{PROC}/[0-9]*/environ rwklx,
 
   # ---- capabilities --------------------------------------------------
   # None. The daemon runs as the user, with no setuid, no setcap and no
@@ -154,5 +159,14 @@ profile uictld /usr/libexec/uictld {
   # Receive SIGTERM/SIGINT/SIGUSR1 from the user's own processes.
   # Sending is not needed: the daemon signals nothing.
   signal (receive) set=(term, int, usr1) peer=unconfined,
-  audit deny ptrace,
+
+  # readlink() on another process's /proc/<pid>/exe is a
+  # PTRACE_MODE_READ_FSCREDS operation, so the file rule above is not
+  # sufficient on its own -- without this, M9's peer-binary check fails
+  # for every client and every bound registry entry silently stops
+  # matching. Read only: tracing, being traced and reading another
+  # process's memory all stay denied, and are denied explicitly so the
+  # narrowness is visible rather than implied.
+  ptrace (read),
+  audit deny ptrace (trace, tracedby, readby),
 }

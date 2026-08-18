@@ -254,7 +254,7 @@
     {"name": "ERR_VERSION", "value": 1, "class": "terminal", "hint": ""},
     {"name": "ERR_OPCODE_UNKNOWN", "value": 2, "class": "terminal", "hint": ""},
     {"name": "ERR_PAYLOAD_INVALID", "value": 3, "class": "terminal", "hint": ""},
-    {"name": "ERR_DENIED_BY_POLICY", "value": 4, "class": "terminal", "hint": "the daemon serves only its own uid"},
+    {"name": "ERR_DENIED_BY_POLICY", "value": 4, "class": "terminal", "hint": "check uictld's stderr: wrong uid, a client name bound to a different binary, or a duplicate handshake"},
     {"name": "ERR_TOO_LARGE", "value": 5, "class": "terminal", "hint": ""},
     {"name": "ERR_INTERNAL", "value": 6, "class": "terminal", "hint": ""},
     {"name": "ERR_BUSY", "value": 7, "class": "retryable", "hint": "the daemon is momentarily full; retry shortly"},

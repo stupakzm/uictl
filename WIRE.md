@@ -552,6 +552,36 @@ Its value is that it is asserted *once, at a checkpoint*, where an
 unknown name can default to the most restrictive class — rather than
 per-frame, like `source_tag`.
 
+**A daemon MAY additionally bind a name to a binary.** A registry entry
+may require that its name be claimed only by a peer running a particular
+executable, checked against `/proc/<peer-pid>/exe`; a peer that fails is
+refused with `ERR_DENIED_BY_POLICY` (4), terminal.
+
+This is **local policy, not protocol**. Nothing on the wire changes,
+nothing is negotiated, and a client cannot discover whether a binding
+applies to it — it either handshakes or it does not. A client library
+should not special-case it: the refusal is already terminal and already
+means "stop and tell the user".
+
+What it changes is the *cost of claiming a name*. Without it, any
+process of the same uid can call itself `agent` and inherit whatever the
+registry gives that name. With it, claiming the name requires running
+the bound binary — a considerably higher bar than typing a string into a
+`HELLO`.
+
+What it does **not** change is that this is evidence, not proof. The
+link is read once, just after `accept()`, so it describes the program
+that was running when the connection was made; a process can `exec`
+something else immediately afterwards while keeping the connected file
+descriptor. Two things bound that: becoming a bound binary requires
+`exec`ing it, which destroys the caller's own image, and the descriptor
+kept across a later `exec` was still opened by the bound program. Treat
+it as a strong signal that is cheap to add, not as a capability.
+
+An unknown executable — `/proc` unreadable, or the binary replaced or
+deleted since it started — **fails the check**. A daemon that cannot
+show the peer is the bound program must not act as though it did.
+
 A valid name is 1–31 bytes of `[A-Za-z0-9._-]`, NUL-terminated, with
 every byte after the NUL also zero. This is not cosmetic:
 
@@ -573,7 +603,8 @@ The name is looked up in `~/.config/uictl/clients`, read **once at
 startup**, one entry per line:
 
 ```
-<name> <class> [confirm] [confirmer] [reconnect=never|backoff[:BASE_MS[:MAX_TRIES]]]
+<name> <class> [confirm] [confirmer] [exe=/abs/path]
+               [reconnect=never|backoff[:BASE_MS[:MAX_TRIES]]]
 ```
 
 It yields:
@@ -582,6 +613,7 @@ It yields:
 |---|---|
 | class | `untrusted` (5/s), `standard` (20/s), `interactive` (50/s) |
 | roles | `confirm` (device requests need a human, §7), `confirmer` (may subscribe) |
+| binary binding | `exe=` — the name may only be claimed by that executable |
 | reconnect advice | returned in the response, §8.6 |
 
 **A name not in the registry — or no registry file at all — is
@@ -646,7 +678,7 @@ already knows to the same meaning.
 | 1 | `ERR_VERSION` | terminal | no overlapping protocol version, or a frame stamped off the pinned version (§3.3) |
 | 2 | `ERR_OPCODE_UNKNOWN` | terminal | this daemon does not implement that opcode |
 | 3 | `ERR_PAYLOAD_INVALID` | terminal | wrong length, out-of-range value, or a non-zero reserved field |
-| 4 | `ERR_DENIED_BY_POLICY` | terminal | peer uid mismatch (§1.2), duplicate `HELLO` (§3.6) |
+| 4 | `ERR_DENIED_BY_POLICY` | terminal | peer uid mismatch (§1.2), a name bound to another binary (§3.5), duplicate `HELLO` (§3.6) |
 | 5 | `ERR_TOO_LARGE` | terminal | `payload_len > 4096` |
 | 6 | `ERR_INTERNAL` | terminal | the write to `/dev/uinput` failed, or a daemon bug |
 | 7 | `ERR_BUSY` | retryable | no connection slot right now (§1.3) |
@@ -1501,9 +1533,17 @@ answers a prompt.
 **It is a speed bump in front of a cooperative client, not a boundary
 against a hostile one.** Client names are self-asserted at `HELLO`
 (§3.5), so a hostile process of the same uid can claim the confirmer's
-name and approve its own requests. Nothing name-based can prevent that:
-an `AF_UNIX` socket authenticates a **uid, not a binary**, which is the
-entire reason this broker exists. What bounds a hostile client is the
+name and approve its own requests. An `AF_UNIX` socket authenticates a
+**uid, not a binary**, which is the entire reason this broker exists.
+
+§3.5's binary binding narrows this without closing it. Binding the
+confirmer's name to its executable means a hostile process must *run
+that binary* to claim the name rather than merely naming it — a
+considerably higher bar, and one worth setting for the confirmer above
+every other entry. It is still not a boundary: the binding is checked
+once, at accept, and is evidence rather than proof. Design as though a
+determined local attacker of the same uid can be the confirmer, because
+they can. What bounds a hostile client is the
 deny-list, the allowlist, and the rate limiter — see §5B.0 and §5A.0.
 
 Stating that plainly is part of the specification. A reader who mistakes
