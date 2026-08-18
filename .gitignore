@@ -8,3 +8,10 @@ __pycache__/
 
 # WIRE.md is the product, not working notes — it ships.
 !WIRE.md
+
+# libuictl and the two generated build artefacts. `*.o` above already
+# covers src/lib/libuictl.o.
+libuictl.a
+libuictl.so
+lib-smoke
+gen-vectors

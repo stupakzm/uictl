@@ -14,6 +14,9 @@ all: uictl uictld uictl-confirm
 UICTLD_SRCS = src/uictld.c src/platform/uinput.c
 UICTLD_HDRS = src/proto.h src/platform/uinput.h
 
+LIB_SRCS = src/lib/libuictl.c
+LIB_HDRS = src/lib/uictl.h src/proto.h
+
 uictl: src/uictl.c src/proto.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -23,6 +26,25 @@ uictl-confirm: src/uictl-confirm.c src/proto.h
 uictld:	$(UICTLD_SRCS) $(UICTLD_HDRS)
 	$(CC) $(CFLAGS) $(UICTLD_SRCS) -o $@ $(LDFLAGS)
 
+# libuictl (M-lib task 2). Not in `all`: nothing in this repo links it
+# yet -- the CLI predates it -- so building it by default would only
+# produce artefacts nobody consumes. `make lib` builds both forms.
+lib: libuictl.a libuictl.so
+
+libuictl.a: $(LIB_SRCS) $(LIB_HDRS)
+	$(CC) $(CFLAGS) -c $(LIB_SRCS) -o src/lib/libuictl.o
+	$(AR) rcs $@ src/lib/libuictl.o
+
+# -fPIC replaces -fPIE and -shared replaces -pie, and the swap is the
+# whole reason this rule is separate rather than reusing the object
+# above. Everything else in the hardening block is kept verbatim: RELRO,
+# BIND_NOW, noexecstack and the stack protector all apply to a shared
+# object exactly as they do to an executable, and a library built softer
+# than the binaries that link it is the soft target.
+libuictl.so: $(LIB_SRCS) $(LIB_HDRS)
+	$(CC) $(filter-out -fPIE,$(CFLAGS)) -fPIC -shared $(LIB_SRCS) -o $@ \
+		$(filter-out -pie,$(LDFLAGS))
+
 # WIRE.md §9's conformance vectors are generated from src/proto.h rather
 # than typed, so a field that moves in the header moves in the document.
 # Not part of `all`: it is a documentation tool, not a shipped binary,
@@ -30,6 +52,7 @@ uictld:	$(UICTLD_SRCS) $(UICTLD_HDRS)
 gen-vectors: tests/gen_vectors.c src/proto.h
 	@$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) && ./$@ && rm -f $@
 
-.PHONY: all clean gen-vectors
+.PHONY: all clean lib gen-vectors
 clean:
-	rm -f uictl uictld uictl-confirm gen-vectors
+	rm -f uictl uictld uictl-confirm gen-vectors \
+	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke
