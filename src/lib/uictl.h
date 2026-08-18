@@ -79,6 +79,90 @@ enum uictl_class {
   UICTL_CLASS_CORRECTABLE  /* handshake on this connection, then retry */
 };
 
+/* ---- the wire, as a consumer needs it -------------------------------
+   Opcode numbers, result codes and capability bits are part of the
+   protocol, so a consumer linking this library needs them: it cannot
+   call uictl_has_op() or interpret uictl_error.result without them.
+
+   They are declared HERE rather than by including the daemon's
+   src/proto.h, because that header is the daemon's — full of its
+   internal reasoning, its read_full/write_full helpers, and structs no
+   consumer should be encoding by hand. Installing it as public API
+   would make every one of those a compatibility surface.
+
+   The duplication is checked, not trusted: libuictl.c carries a
+   _Static_assert for every value below against proto.h, so a number
+   that changes in one place and not the other fails the BUILD. Same
+   guard-rail pattern the daemon uses where its platform capabilities
+   become wire capabilities.
+
+   The names are prefixed and the enums are named differently from
+   proto.h's on purpose — libuictl.c includes both headers, and a
+   collision there would be a compile error rather than a design. */
+
+enum uictl_opcode {
+  UICTL_OP_PING = 1,
+  UICTL_OP_MOVE_ABS = 2,
+  UICTL_OP_HELLO = 3,
+  UICTL_OP_KEY_TAP = 4,
+  UICTL_OP_KEY_SEQUENCE = 5,
+  UICTL_OP_KEY_DOWN = 6,
+  UICTL_OP_KEY_UP = 7,
+  UICTL_OP_CONFIRM_SUBSCRIBE = 8,
+  UICTL_OP_CONFIRM_REQUEST = 9, /* daemon -> client; see WIRE.md §7.4 */
+  UICTL_OP_CONFIRM_DECIDE = 10,
+  UICTL_OP_BUTTON = 11,
+  UICTL_OP_MOVE_REL = 12,
+  UICTL_OP_SCROLL = 13,
+  UICTL_OP_BATCH = 14
+};
+
+/* WIRE.md §4.1. Append only; never renumber. */
+enum uictl_wire_result {
+  UICTL_RES_OK = 0,
+  UICTL_RES_VERSION = 1,
+  UICTL_RES_OPCODE_UNKNOWN = 2,
+  UICTL_RES_PAYLOAD_INVALID = 3,
+  UICTL_RES_DENIED_BY_POLICY = 4,
+  UICTL_RES_TOO_LARGE = 5,
+  UICTL_RES_INTERNAL = 6,
+  UICTL_RES_BUSY = 7,
+  UICTL_RES_HANDSHAKE_REQUIRED = 8,
+  UICTL_RES_KEY_DENYLISTED = 9,
+  UICTL_RES_KEY_NOT_ALLOWED = 10,
+  UICTL_RES_RATE_LIMITED = 11,
+  UICTL_RES_KEY_ALREADY_HELD = 12,
+  UICTL_RES_KEY_HELD_BY_OTHER = 13,
+  UICTL_RES_KEY_NOT_HELD = 14,
+  UICTL_RES_TOO_MANY_HELD = 15,
+  UICTL_RES_CONFIRM_UNAVAILABLE = 16,
+  UICTL_RES_CONFIRM_DENIED = 17,
+  UICTL_RES_CONFIRM_TIMEOUT = 18,
+  UICTL_RES_NOT_CONFIRMER = 19
+};
+
+/* uictl_device_caps() bits. These describe the DEVICE; uictl_has_op()
+   describes the PROTOCOL. Capability is not permission (WIRE.md §3.4). */
+#define UICTL_CAP_POINTER_ABS 0x1u
+#define UICTL_CAP_KEYBOARD 0x2u
+#define UICTL_CAP_POINTER_REL 0x4u
+#define UICTL_CAP_BUTTONS 0x8u
+
+/* uictl_set_source_tag() values. Advisory. See §2.5 before using them
+   for anything that looks like a decision. */
+#define UICTL_SRC_CLI 0x1u
+#define UICTL_SRC_HOTKEY 0x2u
+#define UICTL_SRC_LLM 0x4u
+
+/* Reconnect advice from §8.6, as uictl_reconnect_advice() reports it. */
+#define UICTL_RECONNECT_UNSPEC 0u
+#define UICTL_RECONNECT_NEVER 1u
+#define UICTL_RECONNECT_BACKOFF 2u
+
+#define UICTL_NAME_MAX 32       /* including the NUL */
+#define UICTL_MAX_SEQ_STEPS 16
+#define UICTL_MAX_BATCH_STEPS 16
+
 /* ---- connection ----------------------------------------------------- */
 
 typedef struct uictl_conn uictl_conn;
@@ -142,6 +226,12 @@ void uictl_set_source_tag(uictl_conn *c, uint32_t tag);
 /* ---- what the daemon told us at HELLO -------------------------------
    All four are read from the HELLO response and are meaningless on a
    UICTL_NO_HELLO connection. */
+
+/* The protocol range THIS BUILD of the library speaks, independent of
+   any connection — what it puts in a HELLO's proto_min/proto_max.
+   Exposed so a consumer can report the negotiation honestly: "1
+   (asked 1-1)" says more than "1" when the two ever differ. */
+void uictl_proto_range(uint16_t *min, uint16_t *max);
 
 uint16_t uictl_proto_selected(const uictl_conn *c);
 uint16_t uictl_device_caps(const uictl_conn *c);  /* CAP_* bits         */

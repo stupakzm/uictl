@@ -17,8 +17,11 @@ UICTLD_HDRS = src/proto.h src/platform/uinput.h
 LIB_SRCS = src/lib/libuictl.c
 LIB_HDRS = src/lib/uictl.h src/proto.h
 
-uictl: src/uictl.c src/proto.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The CLI links libuictl rather than encoding frames itself (M-lib
+# task 2). One encoder in this tree, and it is the one WIRE.md §9's
+# vectors are checked against.
+uictl: src/uictl.c libuictl.a $(LIB_HDRS)
+	$(CC) $(CFLAGS) src/uictl.c libuictl.a -o $@ $(LDFLAGS)
 
 uictl-confirm: src/uictl-confirm.c src/proto.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -55,4 +58,5 @@ gen-vectors: tests/gen_vectors.c src/proto.h
 .PHONY: all clean lib gen-vectors
 clean:
 	rm -f uictl uictld uictl-confirm gen-vectors \
-	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke
+	  libuictl.a libuictl.so src/lib/libuictl.o lib-smoke \
+	 

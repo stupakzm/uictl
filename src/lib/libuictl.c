@@ -15,6 +15,63 @@
 
 #define HDR_SIZE (sizeof(struct uictl_frame_header))
 
+/* The public header declares the wire constants so a consumer does not
+   have to install the daemon's proto.h. This is where the duplication
+   stops being a duplication: every value is checked against the header
+   the daemon compiles against, and a number that moves in one place and
+   not the other fails the BUILD rather than shipping a library that
+   speaks a slightly different protocol. */
+#define SAME(pub, priv) _Static_assert((int)(pub) == (int)(priv), #pub " drifted from " #priv)
+SAME(UICTL_OP_PING, OP_PING);
+SAME(UICTL_OP_MOVE_ABS, OP_MOVE_ABS);
+SAME(UICTL_OP_HELLO, OP_HELLO);
+SAME(UICTL_OP_KEY_TAP, OP_KEY_TAP);
+SAME(UICTL_OP_KEY_SEQUENCE, OP_KEY_SEQUENCE);
+SAME(UICTL_OP_KEY_DOWN, OP_KEY_DOWN);
+SAME(UICTL_OP_KEY_UP, OP_KEY_UP);
+SAME(UICTL_OP_CONFIRM_SUBSCRIBE, OP_CONFIRM_SUBSCRIBE);
+SAME(UICTL_OP_CONFIRM_REQUEST, OP_CONFIRM_REQUEST);
+SAME(UICTL_OP_CONFIRM_DECIDE, OP_CONFIRM_DECIDE);
+SAME(UICTL_OP_BUTTON, OP_BUTTON);
+SAME(UICTL_OP_MOVE_REL, OP_MOVE_REL);
+SAME(UICTL_OP_SCROLL, OP_SCROLL);
+SAME(UICTL_OP_BATCH, OP_BATCH);
+SAME(UICTL_RES_OK, OK);
+SAME(UICTL_RES_VERSION, ERR_VERSION);
+SAME(UICTL_RES_OPCODE_UNKNOWN, ERR_OPCODE_UNKNOWN);
+SAME(UICTL_RES_PAYLOAD_INVALID, ERR_PAYLOAD_INVALID);
+SAME(UICTL_RES_DENIED_BY_POLICY, ERR_DENIED_BY_POLICY);
+SAME(UICTL_RES_TOO_LARGE, ERR_TOO_LARGE);
+SAME(UICTL_RES_INTERNAL, ERR_INTERNAL);
+SAME(UICTL_RES_BUSY, ERR_BUSY);
+SAME(UICTL_RES_HANDSHAKE_REQUIRED, ERR_HANDSHAKE_REQUIRED);
+SAME(UICTL_RES_KEY_DENYLISTED, ERR_KEY_DENYLISTED);
+SAME(UICTL_RES_KEY_NOT_ALLOWED, ERR_KEY_NOT_ALLOWED);
+SAME(UICTL_RES_RATE_LIMITED, ERR_RATE_LIMITED);
+SAME(UICTL_RES_KEY_ALREADY_HELD, ERR_KEY_ALREADY_HELD);
+SAME(UICTL_RES_KEY_HELD_BY_OTHER, ERR_KEY_HELD_BY_OTHER);
+SAME(UICTL_RES_KEY_NOT_HELD, ERR_KEY_NOT_HELD);
+SAME(UICTL_RES_TOO_MANY_HELD, ERR_TOO_MANY_HELD);
+SAME(UICTL_RES_CONFIRM_UNAVAILABLE, ERR_CONFIRM_UNAVAILABLE);
+SAME(UICTL_RES_CONFIRM_DENIED, ERR_CONFIRM_DENIED);
+SAME(UICTL_RES_CONFIRM_TIMEOUT, ERR_CONFIRM_TIMEOUT);
+SAME(UICTL_RES_NOT_CONFIRMER, ERR_NOT_CONFIRMER);
+SAME(UICTL_CAP_POINTER_ABS, CAP_POINTER_ABS);
+SAME(UICTL_CAP_KEYBOARD, CAP_KEYBOARD);
+SAME(UICTL_CAP_POINTER_REL, CAP_POINTER_REL);
+SAME(UICTL_CAP_BUTTONS, CAP_BUTTONS);
+SAME(UICTL_SRC_CLI, SRC_CLI);
+SAME(UICTL_SRC_HOTKEY, SRC_HOTKEY);
+SAME(UICTL_SRC_LLM, SRC_LLM);
+SAME(UICTL_RECONNECT_UNSPEC, RECONNECT_UNSPEC);
+SAME(UICTL_RECONNECT_NEVER, RECONNECT_NEVER);
+SAME(UICTL_RECONNECT_BACKOFF, RECONNECT_BACKOFF);
+SAME(UICTL_NAME_MAX, UICTL_CLIENT_NAME_MAX);
+SAME(UICTL_MAX_SEQ_STEPS, UICTL_SEQ_MAX);
+SAME(UICTL_MAX_BATCH_STEPS, UICTL_BATCH_MAX);
+#undef SAME
+
+
 /* How many requests may be in flight at once. Not a protocol limit --
    the daemon dispatches up to 32 frames per epoll turn (WIRE.md §1.6)
    and does not track how many a client has outstanding -- but a bound
@@ -378,6 +435,13 @@ int uictl_reconnect(uictl_conn *c, struct uictl_error *e) {
 }
 
 /* ---- capability accessors -------------------------------------------- */
+
+void uictl_proto_range(uint16_t *min, uint16_t *max) {
+  if (min)
+    *min = UICTL_PROTO_MIN;
+  if (max)
+    *max = UICTL_PROTO_MAX;
+}
 
 uint16_t uictl_proto_selected(const uictl_conn *c) {
   return c && c->have_caps ? c->caps.proto_selected : 0;
