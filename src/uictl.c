@@ -156,7 +156,7 @@ static void explain(uint16_t result, long detail) {
             "worse, the bucket\n"
             "        refills over time. limits are 5/s untrusted, 20/s "
             "standard,\n"
-            "        50/s interactive. to get a higher class, add a line "
+            "        100/s interactive. to get a higher class, add a line "
             "like\n"
             "        `myclient interactive` to ~/.config/uictl/clients "
             "(mode 0600),\n"

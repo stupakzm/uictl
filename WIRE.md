@@ -611,7 +611,7 @@ It yields:
 
 | | |
 |---|---|
-| class | `untrusted` (5/s), `standard` (20/s), `interactive` (50/s) |
+| class | `untrusted` (5/s), `standard` (20/s), `interactive` (100/s) |
 | roles | `confirm` (device requests need a human, §7), `confirmer` (may subscribe) |
 | binary binding | `exe=` — the name may only be claimed by that executable |
 | reconnect advice | returned in the response, §8.6 |

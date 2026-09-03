@@ -1678,8 +1678,25 @@ struct rate_class {
 static const struct rate_class rate_classes[CLASS__COUNT] = {
     [CLASS_UNTRUSTED] = {5, 5},
     [CLASS_STANDARD] = {20, 20},
-    [CLASS_INTERACTIVE] = {50, 50},
+    [CLASS_INTERACTIVE] = {100, 100},
 };
+
+/* **Why interactive is 100 and not 50, raised 2026-08-27.** The number was
+   never about the devices — uinput will take far more than this — it was
+   about bounding what one trusted client can do to a desktop. 50/s was
+   picked when the only pointer motion in sight was one nudge per keypress.
+   muvor's movement mode is a *tick*, one MOVE_ABS per frame, and a pointer
+   that updates 30 times a second on a 144 Hz panel is visibly steppy: it
+   asked for 90 Hz, and 90 > 50 means the bucket empties in 1.25 s of
+   sweeping and every other frame after that comes back ERR_RATE_LIMITED,
+   which is a stutter and not a limit doing its job.
+
+   100 keeps the shape of the thing — a sustained ceiling, a burst equal to
+   it, a refusal rather than a queue — and leaves 10/s of headroom above
+   muvor's 90 for the buttons it sends while sweeping. RATE_GLOBAL_PER_SEC
+   stays 200: the daemon-wide backstop is what actually bounds total device
+   traffic across every pid, and 90 + 20 + the odd CLI invocation still sits
+   well inside it. */
 
 struct rate_bucket {
   pid_t pid;
@@ -1697,7 +1714,7 @@ static struct rate_bucket rate_buckets[RATE_BUCKETS];
 
    A daemon-wide bucket bounds total device traffic no matter how many
    pids appear. It is sized well above the sum of the intended clients
-   (muvor 50/s + auto-c 20/s + occasional CLI) so it never shapes normal
+   (muvor 90/s + auto-c 20/s + occasional CLI) so it never shapes normal
    use; it is a ceiling on the pathological case, not a second tier.
 
    Every peer is the same uid (invariant 9), so daemon-wide and uid-wide
